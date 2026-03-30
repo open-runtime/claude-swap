@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,45 +19,6 @@ from claude_swap.exceptions import (
 )
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
-
-
-def configure_status_sweep_mocks(
-    switcher: ClaudeAccountSwitcher,
-    current_account: str,
-    credentials_by_account: dict[str, str],
-) -> dict[str, str]:
-    """Configure in-memory credential + usage mocks for status sweep tests."""
-    active_credentials = {"value": credentials_by_account[current_account]}
-    switcher._read_credentials = MagicMock(
-        side_effect=lambda: active_credentials["value"]
-    )
-    switcher._write_credentials = MagicMock(
-        side_effect=lambda value: active_credentials.__setitem__("value", value)
-    )
-    switcher._read_account_credentials = MagicMock(
-        side_effect=lambda num, email: credentials_by_account[num]
-    )
-    switcher._fetch_usage_for_token = MagicMock(
-        side_effect=lambda token: {
-            "state": "ready",
-            "detail": "OK",
-            "rate_limited_until": None,
-            "windows": {
-                "five_hour": {
-                    "utilization": 10.0,
-                    "resets_at": "2026-03-18T00:00:00+00:00",
-                }
-            },
-            "source": "usage_api",
-            "raw": {
-                "five_hour": {
-                    "utilization": 10.0,
-                    "resets_at": "2026-03-18T00:00:00+00:00",
-                }
-            },
-        }
-    )
-    return active_credentials
 
 
 class TestEmailValidation:
@@ -182,7 +144,7 @@ class TestGetCurrentAccount:
     def test_with_valid_config(self, temp_home: Path, mock_claude_config: Path):
         """Test reading email from valid config."""
         switcher = ClaudeAccountSwitcher()
-        assert switcher._get_current_account() == "test@example.com"
+        assert switcher._get_current_account() == ("test@example.com", "")
 
     def test_config_without_oauth(self, temp_home: Path):
         """Test config file without oauthAccount."""
@@ -212,13 +174,13 @@ class TestAccountExists:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        assert switcher._account_exists("account1@example.com") is True
-        assert switcher._account_exists("nonexistent@example.com") is False
+        assert switcher._account_exists("account1@example.com", "") is True
+        assert switcher._account_exists("nonexistent@example.com", "") is False
 
     def test_no_sequence_file(self, temp_home: Path):
         """Test account exists when no sequence file."""
         switcher = ClaudeAccountSwitcher()
-        assert switcher._account_exists("any@example.com") is False
+        assert switcher._account_exists("any@example.com", "") is False
 
 
 class TestResolveAccountIdentifier:
@@ -251,38 +213,6 @@ class TestResolveAccountIdentifier:
         assert switcher._resolve_account_identifier("nonexistent@example.com") is None
         assert switcher._resolve_account_identifier("999") == "999"  # Numbers pass through
 
-    def test_resolve_by_email_requires_number_when_same_email_is_ambiguous(
-        self, temp_home: Path
-    ):
-        """Test same-email accounts require account number selection."""
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 1,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1, 2],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "added": "2024-01-01T00:00:00Z",
-                    },
-                    "2": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "added": "2024-01-02T00:00:00Z",
-                    },
-                },
-            },
-        )
-
-        with pytest.raises(ValidationError, match="Use the account number"):
-            switcher._resolve_account_identifier("shared@example.com")
-
 
 class TestDirectorySetup:
     """Test directory setup."""
@@ -307,6 +237,58 @@ class TestDirectorySetup:
             assert stat.st_mode & 0o777 == 0o700
 
 
+class TestAddAccountRefresh:
+    """Test refreshing credentials for an existing account."""
+
+    def test_readd_existing_account_updates_credentials(
+        self, temp_home: Path, mock_claude_config: Path, capsys
+    ):
+        """Re-adding an existing account should update its credentials, not duplicate it."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        old_creds = json.dumps({"claudeAiOauth": {"accessToken": "old-token"}})
+        new_creds = json.dumps({"claudeAiOauth": {"accessToken": "new-token"}})
+
+        # Track what was written to credential storage
+        stored = {}
+
+        def mock_write_creds(num, email, creds):
+            stored["creds"] = creds
+
+        def mock_read_creds(num, email):
+            return stored.get("creds", "")
+
+        # First add
+        with patch.object(switcher, "_read_credentials", return_value=old_creds), \
+             patch.object(switcher, "_write_account_credentials", side_effect=mock_write_creds):
+            switcher.add_account()
+
+        # Verify first add
+        data = switcher._get_sequence_data()
+        assert len(data["accounts"]) == 1
+        assert data["accounts"]["1"]["email"] == "test@example.com"
+        assert "old-token" in stored["creds"]
+
+        # Re-add same account with new credentials
+        with patch.object(switcher, "_read_credentials", return_value=new_creds), \
+             patch.object(switcher, "_write_account_credentials", side_effect=mock_write_creds):
+            switcher.add_account()
+
+        # Should still have only 1 account
+        data = switcher._get_sequence_data()
+        assert len(data["accounts"]) == 1
+        assert len(data["sequence"]) == 1
+
+        # Should have printed update message
+        output = capsys.readouterr().out
+        assert "Updated credentials" in output
+
+        # Verify credentials were actually updated
+        assert "new-token" in stored["creds"]
+
+
 class TestGetNextAccountNumber:
     """Test getting next account number."""
 
@@ -325,106 +307,6 @@ class TestGetNextAccountNumber:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         assert switcher._get_next_account_number() == 3
-
-
-class TestAddAccount:
-    """Test adding managed accounts."""
-
-    def test_add_account_allows_same_email_when_org_uuid_differs(
-        self, temp_home: Path
-    ):
-        """Test same-email accounts can coexist when Claude identity differs."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                    }
-                }
-            )
-        )
-
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 1,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "added": "2024-01-01T00:00:00Z",
-                    }
-                },
-            },
-        )
-
-        switcher._read_credentials = MagicMock(return_value='{"accessToken":"test"}')
-        switcher._write_account_credentials = MagicMock()
-        switcher._write_account_config = MagicMock()
-
-        switcher.add_account()
-
-        data = switcher._get_sequence_data()
-        assert list(data["accounts"].keys()) == ["1", "2"]
-        assert data["accounts"]["2"]["email"] == "shared@example.com"
-        assert data["accounts"]["2"]["uuid"] == "uuid-b"
-        assert data["accounts"]["2"]["organizationUuid"] == "org-b"
-
-    def test_add_account_prints_organization_name_label(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test added account output includes a differentiating label."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                        "displayName": "Tsavo",
-                    }
-                }
-            )
-        )
-
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 1,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "organizationName": "Work",
-                        "added": "2024-01-01T00:00:00Z",
-                    }
-                },
-            },
-        )
-
-        switcher._read_credentials = MagicMock(return_value='{"accessToken":"test"}')
-        switcher._write_account_credentials = MagicMock()
-        switcher._write_account_config = MagicMock()
-
-        switcher.add_account()
-        captured = capsys.readouterr()
-
-        assert "Added Account 2: shared@example.com [Personal]" in captured.out
 
 
 class TestStatus:
@@ -453,887 +335,684 @@ class TestStatus:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
-        (switcher.configs_dir / ".claude-config-1-test@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "test@example.com",
-                        "accountUuid": "uuid-1",
-                    }
-                }
-            )
-        )
-        (
-            switcher.configs_dir / ".claude-config-2-account2@example.com.json"
-        ).write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "account2@example.com",
-                        "accountUuid": "uuid-2",
-                    }
-                }
-            )
-        )
-        configure_status_sweep_mocks(
-            switcher,
-            "1",
-            {
-                "1": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-1",
-                            "subscriptionType": "pro",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-                "2": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-2",
-                            "subscriptionType": "pro",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-            },
-        )
 
         switcher.status()
 
-    def test_status_matches_same_email_account_by_organization_uuid(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test status chooses the right same-email managed account."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                    }
-                }
-            )
-        )
 
+class TestExtractAccessToken:
+    """Test _extract_access_token."""
+
+    def test_valid_credentials(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 1,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1, 2],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "added": "2024-01-01T00:00:00Z",
-                    },
-                    "2": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "added": "2024-01-02T00:00:00Z",
-                    },
-                },
-            },
-        )
-        (switcher.configs_dir / ".claude-config-1-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                    }
-                }
-            )
-        )
-        (switcher.configs_dir / ".claude-config-2-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                    }
-                }
-            )
-        )
-        configure_status_sweep_mocks(
-            switcher,
-            "2",
-            {
-                "1": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-1",
-                            "subscriptionType": "pro",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-                "2": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-2",
-                            "subscriptionType": "pro",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-            },
-        )
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-test-token"}})
+        assert switcher._extract_access_token(creds) == "sk-test-token"
 
-        switcher.status()
-        captured = capsys.readouterr()
-
-        assert "Original active: Account-2" in captured.out
-        assert "Account-2: shared@example.com" in captured.out
-
-    def test_status_displays_organization_name_label_for_same_email_account(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test status output includes a differentiating organization label."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                    }
-                }
-            )
-        )
-
+    def test_missing_key(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 2,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1, 2],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "organizationName": "Work",
-                        "added": "2024-01-01T00:00:00Z",
-                    },
-                    "2": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                        "added": "2024-01-02T00:00:00Z",
-                    },
-                },
-            },
-        )
-        (switcher.configs_dir / ".claude-config-1-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "organizationName": "Work",
-                    }
-                }
-            )
-        )
-        (switcher.configs_dir / ".claude-config-2-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                    }
-                }
-            )
-        )
-        configure_status_sweep_mocks(
-            switcher,
-            "2",
-            {
-                "1": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-1",
-                            "subscriptionType": "pro",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-                "2": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-2",
-                            "subscriptionType": "max",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-            },
-        )
+        creds = json.dumps({"claudeAiOauth": {}})
+        assert switcher._extract_access_token(creds) is None
 
-        switcher.status()
-        captured = capsys.readouterr()
-
-        assert "Original active: Account-2 (shared@example.com [Personal])" in captured.out
-        assert "Account-1: shared@example.com [Work]" in captured.out
-        assert "Account-2: shared@example.com [Personal]" in captured.out
-
-    def test_status_does_not_fallback_to_email_when_live_org_is_missing_in_backup(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test missing backup org metadata does not falsely match by email."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                    }
-                }
-            )
-        )
-
+    def test_invalid_json(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 1,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "added": "2024-01-01T00:00:00Z",
-                    }
-                },
-            },
-        )
-        (switcher.configs_dir / ".claude-config-1-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                    }
-                }
-            )
-        )
-        configure_status_sweep_mocks(
-            switcher,
-            "1",
-            {
-                "1": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-1",
-                            "subscriptionType": "pro",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                )
-            },
-        )
+        assert switcher._extract_access_token("not-json") is None
 
-        switcher.status()
-        captured = capsys.readouterr()
-
-        assert "Original active: unmanaged (shared@example.com" in captured.out
-        assert "Account-1: shared@example.com" in captured.out
-
-
-class TestListAccounts:
-    """Test list output."""
-
-    def test_list_accounts_displays_organization_name_labels_for_same_email_accounts(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test list output differentiates same-email accounts."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                    }
-                }
-            )
-        )
-
+    def test_empty_string(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 2,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1, 2],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "organizationName": "Work",
-                        "added": "2024-01-01T00:00:00Z",
-                    },
-                    "2": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                        "added": "2024-01-02T00:00:00Z",
-                    },
-                },
-            },
-        )
-
-        switcher.list_accounts()
-        captured = capsys.readouterr()
-
-        assert "1: shared@example.com [Work]" in captured.out
-        assert "2: shared@example.com [Personal] (active)" in captured.out
+        assert switcher._extract_access_token("") is None
 
 
-class TestStatusSweep:
-    """Test multi-account status sweep behavior."""
+class TestFormatReset:
+    """Test _format_reset."""
 
-    def test_format_reusable_in_handles_naive_iso_timestamps(
-        self, temp_home: Path
-    ):
-        """Test naive reset timestamps do not crash human formatting."""
+    def test_same_day_shows_time_only(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
-        assert switcher._format_reusable_in("2099-03-18T02:00:00") is not None
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=2, minutes=15)
+        with patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            countdown, clock = switcher._format_reset(future.isoformat())
+        assert countdown == "2h 15m"
+        # Clock should be HH:MM only (no month/day since same day)
+        assert clock.count(":") == 1
 
-    def test_normalize_usage_windows_supports_resets_at_and_resets_at_camel_case(
-        self, temp_home: Path
-    ):
-        """Test usage windows accept both resets_at and resetsAt fields."""
+    def test_different_day_shows_date(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(days=2)
+        with patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            countdown, clock = switcher._format_reset(future.isoformat())
+        import calendar
+        months = list(calendar.month_abbr)[1:]
+        assert any(m in clock for m in months)
 
-        windows = switcher._normalize_usage_windows(
-            {
-                "five_hour": {
-                    "utilization": 11.0,
-                    "resetsAt": "2026-03-18T01:00:00+00:00",
-                },
-                "seven_day": {
-                    "utilization": 22.0,
-                    "resets_at": "2026-03-19T01:00:00+00:00",
-                },
-            }
-        )
-
-        assert windows["five_hour"]["resets_at"] == "2026-03-18T01:00:00+00:00"
-        assert windows["seven_day"]["resets_at"] == "2026-03-19T01:00:00+00:00"
-
-    def test_collect_status_snapshot_sweeps_all_accounts_and_restores_original_account(
-        self, temp_home: Path
-    ):
-        """Test status snapshot sweeps each managed account and restores original."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "second@example.com",
-                        "accountUuid": "uuid-2",
-                        "organizationUuid": "org-2",
-                        "organizationName": "Second",
-                    }
-                }
-            )
-        )
-
+    def test_minutes_only_when_under_one_hour(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 2,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1, 2],
-                "accounts": {
-                    "1": {
-                        "email": "first@example.com",
-                        "uuid": "uuid-1",
-                        "organizationUuid": "org-1",
-                        "organizationName": "First",
-                        "added": "2024-01-01T00:00:00Z",
-                    },
-                    "2": {
-                        "email": "second@example.com",
-                        "uuid": "uuid-2",
-                        "organizationUuid": "org-2",
-                        "organizationName": "Second",
-                        "added": "2024-01-02T00:00:00Z",
-                    },
-                },
-            },
-        )
-        (switcher.configs_dir / ".claude-config-1-first@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "first@example.com",
-                        "accountUuid": "uuid-1",
-                        "organizationUuid": "org-1",
-                        "organizationName": "First",
-                    }
-                }
-            )
-        )
-        (switcher.configs_dir / ".claude-config-2-second@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "second@example.com",
-                        "accountUuid": "uuid-2",
-                        "organizationUuid": "org-2",
-                        "organizationName": "Second",
-                    }
-                }
-            )
-        )
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(minutes=45)
+        with patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            countdown, clock = switcher._format_reset(future.isoformat())
+        assert countdown == "45m"
+        assert "h" not in countdown
 
-        credentials_by_account = {
-            "1": json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "accessToken": "token-1",
-                        "subscriptionType": "pro",
-                        "scopes": ["user:profile"],
-                    }
-                }
-            ),
-            "2": json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "accessToken": "token-2",
-                        "subscriptionType": "max",
-                        "scopes": ["user:profile"],
-                    }
-                }
-            ),
+
+class TestFetchUsage:
+    """Test _fetch_usage."""
+
+    def test_success(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=1)
+        response_data = {
+            "five_hour": {"utilization": 22.0, "resets_at": future.isoformat()},
+            "seven_day": {"utilization": 61.0, "resets_at": future.isoformat()},
         }
-        active_credentials = {"value": credentials_by_account["2"]}
-        fetch_order: list[str] = []
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(response_data).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
 
-        switcher._read_credentials = MagicMock(
-            side_effect=lambda: active_credentials["value"]
-        )
-        switcher._write_credentials = MagicMock(
-            side_effect=lambda value: active_credentials.__setitem__("value", value)
-        )
-        switcher._read_account_credentials = MagicMock(
-            side_effect=lambda num, email: credentials_by_account[num]
-        )
-        switcher._fetch_usage_for_token = MagicMock(
-            side_effect=lambda token: (
-                fetch_order.append(token)
-                or {
-                    "state": "ready",
-                    "detail": "OK",
-                    "rate_limited_until": None,
-                    "windows": {
-                        "five_hour": {
-                            "utilization": 10.0 if token == "token-1" else 20.0,
-                            "resets_at": "2026-03-18T00:00:00+00:00",
-                        }
-                    },
-                    "source": "usage_api",
-                    "raw": {
-                        "five_hour": {
-                            "utilization": 10.0 if token == "token-1" else 20.0,
-                            "resets_at": "2026-03-18T00:00:00+00:00",
-                        }
-                    },
-                }
-            )
-        )
+        with patch("urllib.request.urlopen", return_value=mock_response), \
+             patch("claude_swap.switcher.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = switcher._fetch_usage("sk-test-token")
 
-        payload = switcher._collect_status_snapshot()
+        assert result["five_hour"]["pct"] == 22.0
+        assert result["seven_day"]["pct"] == 61.0
+        assert result["five_hour"]["countdown"] == "1h 0m"
 
-        assert fetch_order == ["token-1", "token-2"]
-        assert payload["original_active_account_number"] == "2"
-        assert payload["restored_active_account_number"] == "2"
-        assert [account["account_number"] for account in payload["accounts"]] == [
-            "1",
-            "2",
-        ]
-        assert payload["accounts"][0]["usage"]["windows"]["five_hour"]["utilization"] == 10.0
-        assert payload["accounts"][1]["usage"]["windows"]["five_hour"]["utilization"] == 20.0
-        assert active_credentials["value"] == credentials_by_account["2"]
-        restored_config = json.loads(config_path.read_text())
-        assert restored_config["oauthAccount"]["organizationUuid"] == "org-2"
+    def test_network_error(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
+            result = switcher._fetch_usage("sk-test-token")
+        assert result is None
 
-    def test_collect_status_snapshot_includes_accounts_missing_from_sequence(
-        self, temp_home: Path
+    def test_bad_response(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"{}"
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            result = switcher._fetch_usage("sk-test-token")
+        assert result is None
+
+
+class TestListAccountsUsage:
+    """Test list_accounts shows usage info."""
+
+    def test_list_shows_usage(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """Test accounts present in storage but missing from sequence are still swept."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "second@example.com",
-                        "accountUuid": "uuid-2",
-                        "organizationUuid": "org-2",
-                    }
-                }
-            )
-        )
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        usage_response = {
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 50.0, "resets_at": "2026-01-02T00:00:00Z"},
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(usage_response).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 2,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [2],
-                "accounts": {
-                    "1": {
-                        "email": "first@example.com",
-                        "uuid": "uuid-1",
-                        "organizationUuid": "org-1",
-                        "added": "2024-01-01T00:00:00Z",
-                    },
-                    "2": {
-                        "email": "second@example.com",
-                        "uuid": "uuid-2",
-                        "organizationUuid": "org-2",
-                        "added": "2024-01-02T00:00:00Z",
-                    },
-                },
-            },
-        )
-        (switcher.configs_dir / ".claude-config-1-first@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "first@example.com",
-                        "accountUuid": "uuid-1",
-                        "organizationUuid": "org-1",
-                    }
-                }
-            )
-        )
-        (switcher.configs_dir / ".claude-config-2-second@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "second@example.com",
-                        "accountUuid": "uuid-2",
-                        "organizationUuid": "org-2",
-                    }
-                }
-            )
-        )
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        configure_status_sweep_mocks(
-            switcher,
-            "2",
-            {
-                "1": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-1",
-                            "subscriptionType": "pro",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-                "2": json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "token-2",
-                            "subscriptionType": "max",
-                            "scopes": ["user:profile"],
-                        }
-                    }
-                ),
-            },
-        )
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("urllib.request.urlopen", return_value=mock_response):
+            switcher.list_accounts()
 
-        payload = switcher._collect_status_snapshot()
+        output = capsys.readouterr().out
+        assert "test@example.com [personal] (active)" in output
+        assert "account2@example.com" in output
+        assert "├ 5h:" in output
+        assert "└ 7d:" in output
+        assert "10%" in output
+        assert "50%" in output
 
-        assert [account["account_number"] for account in payload["accounts"]] == [
-            "2",
-            "1",
-        ]
-
-    def test_collect_status_snapshot_restores_unmanaged_original_without_stale_active_account_number(
-        self, temp_home: Path
+    def test_list_no_credentials(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """Test restoring an unmanaged original account clears activeAccountNumber."""
-        config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                    }
-                }
-            )
-        )
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 1,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "added": "2024-01-01T00:00:00Z",
-                    }
-                },
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(switcher, "_read_account_credentials", return_value=""):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert "no credentials" in output
+
+
+# ── Task 1: AccountInfo org fields ───────────────────────────────────────────
+
+class TestAccountInfoOrgFields:
+    def test_account_info_includes_org_fields(self):
+        """AccountInfo should store organization UUID and name."""
+        from claude_swap.models import AccountInfo
+        info = AccountInfo(
+            email="user@example.com",
+            uuid="user-uuid",
+            organization_uuid="org-uuid-123",
+            organization_name="Acme Corp",
+            added="2024-01-01T00:00:00Z",
+            number=1,
+        )
+        assert info.organization_uuid == "org-uuid-123"
+        assert info.organization_name == "Acme Corp"
+
+    def test_account_info_personal_account_has_empty_org(self):
+        """Personal accounts should have empty string for organization fields."""
+        from claude_swap.models import AccountInfo
+        info = AccountInfo.from_dict(1, {
+            "email": "user@example.com",
+            "uuid": "user-uuid",
+            "added": "2024-01-01T00:00:00Z",
+        })
+        assert info.organization_uuid == ""
+        assert info.organization_name == ""
+
+    def test_account_info_to_dict_includes_org_fields(self):
+        """to_dict() should include organization fields."""
+        from claude_swap.models import AccountInfo
+        info = AccountInfo(
+            email="user@example.com",
+            uuid="user-uuid",
+            organization_uuid="org-uuid",
+            organization_name="Acme",
+            added="2024-01-01T00:00:00Z",
+            number=1,
+        )
+        d = info.to_dict()
+        assert d["organizationUuid"] == "org-uuid"
+        assert d["organizationName"] == "Acme"
+
+    def test_account_info_is_organization_property(self):
+        """is_organization should be determined by organizationUuid presence."""
+        from claude_swap.models import AccountInfo
+        org = AccountInfo.from_dict(1, {"email": "u@e.com", "uuid": "u", "added": "", "organizationUuid": "o"})
+        personal = AccountInfo.from_dict(2, {"email": "u@e.com", "uuid": "u", "added": ""})
+        assert org.is_organization is True
+        assert personal.is_organization is False
+
+    def test_account_info_display_label(self):
+        """display_label should include org name or personal tag."""
+        from claude_swap.models import AccountInfo
+        org = AccountInfo(email="u@e.com", uuid="u", organization_uuid="o",
+                          organization_name="Acme", added="", number=1)
+        personal = AccountInfo(email="u@e.com", uuid="u", organization_uuid="",
+                               organization_name="", added="", number=2)
+        assert org.display_label == "u@e.com [Acme]"
+        assert personal.display_label == "u@e.com [personal]"
+
+
+# ── Task 3: _account_exists composite key ────────────────────────────────────
+
+class TestAccountExistsCompositeKey:
+    def test_distinguishes_org_and_personal(self, temp_home, mock_credentials_file):
+        """Accounts with same email but different organizationUuid should be treated as distinct."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps({
+            "activeAccountNumber": 1,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "user@example.com",
+                    "uuid": "user-uuid",
+                    "organizationUuid": "org-uuid-A",
+                    "organizationName": "Acme",
+                    "added": "2024-01-01T00:00:00Z",
+                }
             },
-        )
-        (switcher.configs_dir / ".claude-config-1-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                    }
-                }
-            )
-        )
-
-        original_credentials = json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "token-original",
-                    "subscriptionType": "pro",
-                    "scopes": ["user:profile"],
-                }
-            }
-        )
-        managed_credentials = json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "token-managed",
-                    "subscriptionType": "pro",
-                    "scopes": ["user:profile"],
-                }
-            }
-        )
-        active_credentials = {"value": original_credentials}
-
-        switcher._read_credentials = MagicMock(
-            side_effect=lambda: active_credentials["value"]
-        )
-        switcher._write_credentials = MagicMock(
-            side_effect=lambda value: active_credentials.__setitem__("value", value)
-        )
-        switcher._read_account_credentials = MagicMock(
-            side_effect=lambda num, email: managed_credentials
-        )
-        switcher._fetch_usage_for_token = MagicMock(
-            return_value={
-                "state": "ready",
-                "detail": "OK",
-                "rate_limited_until": None,
-                "windows": {
-                    "five_hour": {
-                        "utilization": 5.0,
-                        "resets_at": "2026-03-18T00:00:00+00:00",
-                    }
-                },
-                "source": "usage_api",
-                "raw": {},
-            }
-        )
-
-        payload = switcher._collect_status_snapshot()
-        stored_sequence = switcher._read_json(switcher.sequence_file)
-
-        assert payload["original_active_account_number"] is None
-        assert payload["restored_active_account_number"] is None
-        assert stored_sequence["activeAccountNumber"] is None
-        assert active_credentials["value"] == original_credentials
-        restored_config = json.loads(config_path.read_text())
-        assert restored_config["oauthAccount"]["organizationUuid"] == "org-b"
-
-    def test_status_json_outputs_sweep_payload(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test JSON mode prints the sweep payload."""
+        }))
         switcher = ClaudeAccountSwitcher()
-        switcher._collect_status_snapshot = MagicMock(
-            return_value={
-                "swept_at": "2026-03-17T18:00:00Z",
-                "original_active_account_number": "2",
-                "restored_active_account_number": "2",
-                "accounts": [
-                    {
-                        "account_number": "2",
-                        "display": "second@example.com [Second]",
-                        "usage": {"state": "ready", "windows": {}},
-                    }
-                ],
-            }
-        )
+        assert switcher._account_exists("user@example.com", "org-uuid-A") is True
+        assert switcher._account_exists("user@example.com", "") is False
+        assert switcher._account_exists("user@example.com", "org-uuid-B") is False
 
-        switcher.status(as_json=True)
-        captured = capsys.readouterr()
-        payload = json.loads(captured.out)
 
-        assert payload["original_active_account_number"] == "2"
-        assert payload["accounts"][0]["display"] == "second@example.com [Second]"
+# ── Task 4: _get_current_account returns tuple ───────────────────────────────
 
-    def test_status_human_output_includes_usage_details_for_each_account(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test human status output includes per-account usage detail."""
+class TestGetCurrentAccountOrgSupport:
+    def test_returns_org_info(self, temp_home, mock_org_claude_config):
+        """_get_current_account should return (email, organization_uuid) tuple."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
         switcher = ClaudeAccountSwitcher()
-        switcher._collect_status_snapshot = MagicMock(
-            return_value={
-                "swept_at": "2026-03-17T18:00:00Z",
-                "original_active_account_number": "3",
-                "original_active_display": "tsavo@pieces.app [Tsavo Knott]",
-                "restored_active_account_number": "3",
-                "restored_active_display": "tsavo@pieces.app [Tsavo Knott]",
-                "accounts": [
-                    {
-                        "account_number": "2",
-                        "display": "tsavo@pieces.app [Pieces]",
-                        "usage": {
-                            "state": "ready",
-                            "detail": "OK",
-                            "windows": {
-                                "five_hour": {
-                                    "utilization": 12.0,
-                                    "resets_at": "2026-03-18T00:00:00+00:00",
-                                }
-                            },
-                        },
-                    },
-                    {
-                        "account_number": "3",
-                        "display": "tsavo@pieces.app [Tsavo Knott]",
-                        "usage": {
-                            "state": "limited",
-                            "detail": "rate limit",
-                            "rate_limited_until": "2026-03-18T02:00:00+00:00",
-                            "windows": {
-                                "seven_day": {
-                                    "utilization": 100.0,
-                                    "resets_at": "2026-03-18T02:00:00+00:00",
-                                }
-                            },
-                        },
-                    },
-                ],
-            }
-        )
+        result = switcher._get_current_account()
+        assert result == ("user@example.com", "org-uuid-5678")
 
+    def test_returns_empty_org_for_personal(self, temp_home, mock_personal_claude_config):
+        """Personal account should return tuple with empty string for organization_uuid."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        switcher = ClaudeAccountSwitcher()
+        result = switcher._get_current_account()
+        assert result == ("user@example.com", "")
+
+    def test_returns_none_when_no_config(self, temp_home):
+        """Should return None when config file does not exist."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        switcher = ClaudeAccountSwitcher()
+        result = switcher._get_current_account()
+        assert result is None
+
+
+# ── Task 5: add_account with org fields ──────────────────────────────────────
+
+class TestAddAccountOrgFields:
+    def test_allows_same_email_different_org(self, temp_home):
+        """Should allow adding same-email account if organizationUuid differs."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+        config_path = temp_home / ".claude" / ".claude.json"
+
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid-A",
+                "organizationName": "Acme",
+            }
+        }))
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+            }
+        }))
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        assert len(seq["accounts"]) == 2
+        assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid-A"
+        assert seq["accounts"]["2"]["organizationUuid"] == ""
+
+    def test_blocks_true_duplicate(self, temp_home):
+        """Should block adding an account with identical (email, organizationUuid) combination."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+        config_path = temp_home / ".claude" / ".claude.json"
+        org_config = {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid-A",
+                "organizationName": "Acme",
+            }
+        }
+        config_path.write_text(json.dumps(org_config))
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        import io
+        from contextlib import redirect_stdout
+        f = io.StringIO()
+        config_path.write_text(json.dumps(org_config))
+        with redirect_stdout(f), \
+             patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+        assert "Updated credentials" in f.getvalue()
+
+        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        assert len(seq["accounts"]) == 1
+
+    def test_stores_org_name_in_sequence(self, temp_home):
+        """add_account should store organizationName in sequence.json."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid",
+                "organizationName": "My Org",
+            }
+        }))
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        seq = json.loads((temp_home / ".claude-swap-backup" / "sequence.json").read_text())
+        assert seq["accounts"]["1"]["organizationName"] == "My Org"
+        assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid"
+
+
+# ── Task 6: _resolve_account_identifier ambiguity ────────────────────────────
+
+class TestResolveIdentifierAmbiguity:
+    def test_by_number_always_works(self, temp_home, sample_sequence_data_with_org):
+        """Account number identifier should always resolve correctly."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._resolve_account_identifier("1") == "1"
+        assert switcher._resolve_account_identifier("2") == "2"
+
+    def test_raises_on_ambiguous_email(self, temp_home, sample_sequence_data_with_org):
+        """Should raise ConfigError when email matches multiple accounts."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from claude_swap.exceptions import ConfigError
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+        switcher = ClaudeAccountSwitcher()
+        with pytest.raises(ConfigError, match="ambiguous"):
+            switcher._resolve_account_identifier("user@example.com")
+
+    def test_unique_email_still_works(self, temp_home, sample_sequence_data):
+        """Unique email should still resolve to the correct account number."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._resolve_account_identifier("account1@example.com") == "1"
+
+
+# ── Task 7: list_accounts org display ────────────────────────────────────────
+
+class TestListAccountsOrgDisplay:
+    def test_shows_org_name_and_personal(self, temp_home, mock_credentials_file,
+                                         sample_sequence_data_with_org, capsys):
+        """list_accounts should display org name and personal tag."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from unittest.mock import patch
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+                "organizationUuid": "org-uuid-5678",
+                "organizationName": "Acme Corp",
+            }
+        }))
+
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "Acme Corp" in out
+        assert "personal" in out
+        assert "(active)" in out
+
+    def test_active_account_detected_by_org_uuid(self, temp_home, mock_credentials_file,
+                                                   sample_sequence_data_with_org, capsys):
+        """Only the account matching current org_uuid should be marked (active)."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from unittest.mock import patch
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data_with_org))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid",
+            }
+        }))
+
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if "(active)" in ln]
+        assert len(lines) == 1
+        assert "personal" in lines[0]
+
+
+# ── Task 8: backward compatibility ───────────────────────────────────────────
+
+class TestBackwardCompatibility:
+    def test_old_sequence_json_without_org_fields(self, temp_home, sample_sequence_data, capsys):
+        """Old sequence.json without organizationUuid should work correctly."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from unittest.mock import patch
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account1@example.com",
+                "accountUuid": "uuid-1",
+            }
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text('{"accessToken": "tok"}')
+
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "account1@example.com" in out
+        assert "personal" in out
+
+    def test_status_with_old_sequence_json(self, temp_home, sample_sequence_data, capsys):
+        """status should display personal for old sequence.json entries."""
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir()
+        (backup_dir / "sequence.json").write_text(json.dumps(sample_sequence_data))
+
+        config_path = temp_home / ".claude" / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account1@example.com",
+                "accountUuid": "uuid-1",
+            }
+        }))
+
+        switcher = ClaudeAccountSwitcher()
         switcher.status()
-        captured = capsys.readouterr()
 
-        assert "Original active: Account-3 (tsavo@pieces.app [Tsavo Knott])" in captured.out
-        assert "Restored active: Account-3 (tsavo@pieces.app [Tsavo Knott])" in captured.out
-        assert "Account-2: tsavo@pieces.app [Pieces]" in captured.out
-        assert "Account-3: tsavo@pieces.app [Tsavo Knott]" in captured.out
-        assert "Windows: 5h 12%" in captured.out
-        assert "Usage state: limited" in captured.out
+        out = capsys.readouterr().out
+        assert "account1@example.com" in out
+        assert "personal" in out
 
-    def test_list_accounts_backfills_organization_names_from_backup_configs(
-        self, temp_home: Path, capsys: pytest.CaptureFixture[str]
-    ):
-        """Test legacy managed accounts get readable labels from backup config."""
+
+class TestUpgradeMigration:
+    """Test upgrade path from pre-v0.6.0 (no org fields) to v0.6.0+."""
+
+    def _setup_pre_v06(self, temp_home, sequence_data, live_config):
+        """Helper to set up pre-v0.6.0 state with a live config."""
+        backup_dir = temp_home / ".claude-swap-backup"
+        backup_dir.mkdir(exist_ok=True)
+        (backup_dir / "sequence.json").write_text(json.dumps(sequence_data))
+
         config_path = temp_home / ".claude" / ".claude.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                    }
-                }
-            )
+        config_path.write_text(json.dumps(live_config))
+
+    def test_status_after_upgrade_with_org_uuid(
+        self, temp_home, sample_sequence_data_pre_v06, capsys
+    ):
+        """status() should detect managed account after auto-migration."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        switcher.status()
+
+        out = capsys.readouterr().out
+        assert "Account-1" in out
+        assert "not managed" not in out
+
+    def test_list_after_upgrade_marks_active(
+        self, temp_home, sample_sequence_data_pre_v06, capsys
+    ):
+        """list_accounts() should mark the active account after auto-migration."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
         )
 
         switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(
-            switcher.sequence_file,
-            {
-                "activeAccountNumber": 2,
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "sequence": [1, 2],
-                "accounts": {
-                    "1": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "added": "2024-01-01T00:00:00Z",
-                    },
-                    "2": {
-                        "email": "shared@example.com",
-                        "uuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "added": "2024-01-02T00:00:00Z",
-                    },
-                },
-            },
-        )
-        (switcher.configs_dir / ".claude-config-1-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-a",
-                        "organizationUuid": "org-a",
-                        "organizationName": "Work",
-                    }
-                }
-            )
-        )
-        (switcher.configs_dir / ".claude-config-2-shared@example.com.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "shared@example.com",
-                        "accountUuid": "uuid-b",
-                        "organizationUuid": "org-b",
-                        "organizationName": "Personal",
-                    }
-                }
-            )
+        with patch.object(switcher, "_fetch_usage", return_value=None):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "(active)" in out
+
+    def test_migration_uses_live_config_over_backup(
+        self, temp_home, sample_sequence_data_pre_v06
+    ):
+        """Migration should prefer live config org fields for the active account."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        data = switcher._get_sequence_data_migrated()
+
+        assert data["accounts"]["1"]["organizationUuid"] == "org-uuid-live"
+        assert data["accounts"]["1"]["organizationName"] == "Live Org"
+
+    def test_migration_idempotent(
+        self, temp_home, sample_sequence_data_pre_v06
+    ):
+        """Running migration twice should not change the result."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        data1 = switcher._get_sequence_data_migrated()
+        data2 = switcher._get_sequence_data_migrated()
+
+        assert data1["accounts"]["1"]["organizationUuid"] == data2["accounts"]["1"]["organizationUuid"]
+        assert data1["accounts"]["2"]["organizationUuid"] == data2["accounts"]["2"]["organizationUuid"]
+
+    def test_migration_skips_already_migrated(
+        self, temp_home, sample_sequence_data_pre_v06
+    ):
+        """Accounts that already have org fields should not be changed."""
+        sample_sequence_data_pre_v06["accounts"]["1"]["organizationUuid"] = "existing-org"
+        sample_sequence_data_pre_v06["accounts"]["1"]["organizationName"] = "Existing Org"
+
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "different-org",
+                "organizationName": "Different Org",
+            }
+        })
+
+        switcher = ClaudeAccountSwitcher()
+        data = switcher._get_sequence_data_migrated()
+
+        assert data["accounts"]["1"]["organizationUuid"] == "existing-org"
+        assert data["accounts"]["1"]["organizationName"] == "Existing Org"
+        assert data["accounts"]["2"]["organizationUuid"] == ""
+
+    def test_switch_after_upgrade_no_duplicate(
+        self, temp_home, sample_sequence_data_pre_v06, capsys
+    ):
+        """switch() on pre-v0.6.0 data should not auto-add a duplicate account."""
+        self._setup_pre_v06(temp_home, sample_sequence_data_pre_v06, {
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "accountUuid": "user-uuid-1234",
+                "organizationUuid": "org-uuid-live",
+                "organizationName": "Live Org",
+            }
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
         )
 
-        switcher.list_accounts()
-        captured = capsys.readouterr()
+        switcher = ClaudeAccountSwitcher()
+        backup_dir = temp_home / ".claude-swap-backup"
+        creds_dir = backup_dir / "credentials"
+        creds_dir.mkdir(exist_ok=True)
+        import base64
+        encoded = base64.b64encode(
+            json.dumps({"claudeAiOauth": {"accessToken": "token-2"}}).encode()
+        ).decode()
+        (creds_dir / ".creds-2-other@example.com.enc").write_text(encoded)
 
-        assert "1: shared@example.com [Work]" in captured.out
-        assert "2: shared@example.com [Personal] (active)" in captured.out
+        configs_dir = backup_dir / "configs"
+        configs_dir.mkdir(exist_ok=True)
+        (configs_dir / ".claude-config-2-other@example.com.json").write_text(
+            json.dumps({"oauthAccount": {
+                "emailAddress": "other@example.com",
+                "accountUuid": "other-uuid-5678",
+            }})
+        )
+
+        with patch.object(switcher, "_write_credentials"):
+            switcher.switch()
+
+        data = switcher._get_sequence_data()
+        assert len(data["accounts"]) == 2
+        assert "auto" not in capsys.readouterr().out.lower()
