@@ -39,6 +39,10 @@ DEFAULT_STATUS_USER_AGENT = "claude-code/2.1.77"
 DEFAULT_STATUS_BETA_HEADER = "oauth-2025-04-20"
 DEFAULT_STATUS_TIMEOUT_SECONDS = 20.0
 
+OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
+
 
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
@@ -313,6 +317,94 @@ class ClaudeAccountSwitcher:
             return None
         token = oauth.get("accessToken")
         return token if isinstance(token, str) and token else None
+
+    def _is_oauth_token_expired(self, credentials: str | None) -> bool:
+        """Check if the OAuth token in credentials is expired or about to expire."""
+        oauth = self._parse_credential_payload(credentials)
+        if not oauth:
+            return False
+        expires_at = oauth.get("expiresAt")
+        if not isinstance(expires_at, (int, float)):
+            return False
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+
+    def _refresh_oauth_credentials(self, credentials: str) -> str | None:
+        """Refresh an OAuth access token via the platform token endpoint."""
+        try:
+            data = json.loads(credentials)
+            oauth = data.get("claudeAiOauth")
+            if not isinstance(oauth, dict):
+                return None
+
+            refresh_token = oauth.get("refreshToken")
+            if not refresh_token:
+                return None
+
+            scopes = oauth.get("scopes")
+            if not isinstance(scopes, list) or not scopes:
+                self._logger.debug("OAuth refresh skipped: scopes missing")
+                return None
+
+            body = json.dumps({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": OAUTH_CLIENT_ID,
+                "scope": " ".join(scopes),
+            }).encode()
+
+            req = request.Request(
+                OAUTH_TOKEN_URL,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with request.urlopen(req, timeout=10) as resp:
+                resp_data = json.loads(resp.read().decode())
+
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            oauth["accessToken"] = resp_data["access_token"]
+            oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
+            if resp_data.get("refresh_token"):
+                oauth["refreshToken"] = resp_data["refresh_token"]
+            if resp_data.get("scope"):
+                oauth["scopes"] = resp_data["scope"].split()
+
+            data["claudeAiOauth"] = oauth
+            return json.dumps(data)
+        except Exception as exc:
+            self._logger.debug("OAuth refresh failed: %r", exc)
+            return None
+
+    def _ensure_fresh_credentials(
+        self, account_num: str, email: str, credentials: str
+    ) -> tuple[str, str | None]:
+        """Return (credentials, access_token) after refreshing if expired.
+
+        If the token is expired and refresh succeeds, the refreshed credentials
+        are persisted to backup storage. Returns the working credentials and
+        the extracted access token (or None if no usable token).
+        """
+        access_token = self._extract_access_token(credentials)
+
+        if access_token and not self._is_oauth_token_expired(credentials):
+            return credentials, access_token
+
+        if not self._is_oauth_token_expired(credentials):
+            return credentials, access_token
+
+        self._logger.debug(
+            "OAuth token expired for Account-%s, attempting refresh", account_num
+        )
+        refreshed = self._refresh_oauth_credentials(credentials)
+        if refreshed:
+            self._write_account_credentials(account_num, email, refreshed)
+            self._logger.info(
+                "Refreshed OAuth token for Account-%s", account_num
+            )
+            return refreshed, self._extract_access_token(refreshed)
+
+        return credentials, access_token
 
     def _normalize_expires_at(self, value: Any) -> str | None:
         """Convert credential expiry values to ISO timestamps when possible."""
@@ -901,9 +993,11 @@ class ClaudeAccountSwitcher:
             display = self._format_account_display(account_record)
 
             try:
-                self._activate_account_from_backup(account_num, data)
-                active_credentials = self._read_credentials()
-                if active_credentials is None:
+                account_email = str(account_record.get("email", ""))
+                backup_credentials = self._read_account_credentials(
+                    account_num, account_email
+                )
+                if not backup_credentials:
                     self._logger.warning(
                         "Capacity probe Account-%s: cannot read credentials",
                         account_num,
@@ -911,7 +1005,9 @@ class ClaudeAccountSwitcher:
                     print(f"  Account-{account_num}: {display} — error (no credentials)")
                     continue
 
-                access_token = self._extract_access_token(active_credentials)
+                backup_credentials, access_token = self._ensure_fresh_credentials(
+                    account_num, account_email, backup_credentials
+                )
                 if not access_token:
                     self._logger.warning(
                         "Capacity probe Account-%s: no access token", account_num
@@ -926,6 +1022,23 @@ class ClaudeAccountSwitcher:
                 self._logger.debug(
                     "Capacity probe Account-%s state=%s", account_num, state
                 )
+
+                if state == "auth":
+                    self._logger.debug(
+                        "Capacity probe Account-%s got auth error, attempting refresh",
+                        account_num,
+                    )
+                    refreshed = self._refresh_oauth_credentials(backup_credentials)
+                    if refreshed:
+                        self._write_account_credentials(
+                            account_num, account_email, refreshed
+                        )
+                        retry_token = self._extract_access_token(refreshed)
+                        if retry_token:
+                            usage = self._fetch_usage_for_token(retry_token)
+                            state = usage.get("state")
+                            windows = usage.get("windows", {})
+                            windows_line = self._render_windows_line(windows)
 
                 if state == "ready":
                     status_detail = "ready"
@@ -1148,6 +1261,16 @@ class ClaudeAccountSwitcher:
                             raise CredentialReadError(
                                 "Failed to read active credentials after activation"
                             )
+
+                        account_email = str(account_record.get("email", ""))
+                        is_original = account_num == snapshot.get(
+                            "managed_account_number"
+                        )
+                        if not is_original:
+                            active_credentials, _ = self._ensure_fresh_credentials(
+                                account_num, account_email, active_credentials
+                            )
+
                         token_metadata = self._credential_metadata(active_credentials)
                         access_token = self._extract_access_token(active_credentials)
                         if not access_token:
@@ -1161,6 +1284,20 @@ class ClaudeAccountSwitcher:
                             }
                         else:
                             usage = self._fetch_usage_for_token(access_token)
+                            if usage.get("state") == "auth" and not is_original:
+                                refreshed = self._refresh_oauth_credentials(
+                                    active_credentials
+                                )
+                                if refreshed:
+                                    self._write_account_credentials(
+                                        account_num, account_email, refreshed
+                                    )
+                                    retry_token = self._extract_access_token(refreshed)
+                                    if retry_token:
+                                        usage = self._fetch_usage_for_token(retry_token)
+                                        token_metadata = self._credential_metadata(
+                                            refreshed
+                                        )
 
                         accounts_payload.append(
                             {
@@ -1911,12 +2048,7 @@ class ClaudeAccountSwitcher:
         )
 
         # Probe candidates for one with available capacity
-        with FileLock(self.lock_file):
-            snapshot = self._capture_active_state_snapshot(data)
-            try:
-                best_account, reason = self._find_ready_account(candidates, data)
-            finally:
-                self._restore_active_state_snapshot(snapshot, data)
+        best_account, reason = self._find_ready_account(candidates, data)
 
         if best_account is None:
             print("All accounts are at capacity. No switch performed.")
@@ -1981,22 +2113,34 @@ class ClaudeAccountSwitcher:
 
         # Probe the target account's capacity before switching
         target_record = data.get("accounts", {}).get(target_account, {})
+        target_email = str(target_record.get("email", ""))
         display = self._format_account_display(target_record)
-        with FileLock(self.lock_file):
-            snapshot = self._capture_active_state_snapshot(data)
-            try:
-                self._activate_account_from_backup(target_account, data)
-                active_credentials = self._read_credentials()
-                access_token = (
-                    self._extract_access_token(active_credentials)
-                    if active_credentials
-                    else None
+        try:
+            backup_credentials = self._read_account_credentials(
+                target_account, target_email
+            )
+            if backup_credentials:
+                backup_credentials, access_token = self._ensure_fresh_credentials(
+                    target_account, target_email, backup_credentials
                 )
                 if access_token:
                     usage = self._fetch_usage_for_token(access_token)
                     state = usage.get("state")
                     windows = usage.get("windows", {})
                     windows_line = self._render_windows_line(windows)
+
+                    if state == "auth":
+                        refreshed = self._refresh_oauth_credentials(backup_credentials)
+                        if refreshed:
+                            self._write_account_credentials(
+                                target_account, target_email, refreshed
+                            )
+                            retry_token = self._extract_access_token(refreshed)
+                            if retry_token:
+                                usage = self._fetch_usage_for_token(retry_token)
+                                state = usage.get("state")
+                                windows = usage.get("windows", {})
+                                windows_line = self._render_windows_line(windows)
 
                     if state == "ready":
                         status_detail = "ready"
@@ -2025,12 +2169,10 @@ class ClaudeAccountSwitcher:
                     else:
                         detail = usage.get("detail", state)
                         print(f"Account-{target_account}: {display} — {detail}")
-            except Exception as exc:
-                self._logger.warning(
-                    "Capacity probe failed for Account-%s: %s", target_account, exc
-                )
-            finally:
-                self._restore_active_state_snapshot(snapshot, data)
+        except Exception as exc:
+            self._logger.warning(
+                "Capacity probe failed for Account-%s: %s", target_account, exc
+            )
 
         self._perform_switch(target_account)
 
