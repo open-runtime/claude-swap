@@ -877,6 +877,112 @@ class ClaudeAccountSwitcher:
         )
         return merged_identity or None
 
+    def _find_ready_account(
+        self, candidates: list[str], data: dict
+    ) -> tuple[str | None, str | None]:
+        """Probe candidate accounts and return the first with available capacity.
+
+        Returns (account_number, reason) where reason is a human message when
+        no ready account is found.  The caller must already hold the file lock
+        and must restore the active state afterwards.
+        """
+        best_limited: tuple[str, datetime | None] | None = None
+
+        print("Checking account capacity...")
+
+        for account_num in candidates:
+            account_record = data.get("accounts", {}).get(account_num)
+            if not isinstance(account_record, dict):
+                self._logger.warning(
+                    "Capacity probe skipping Account-%s: missing record", account_num
+                )
+                continue
+
+            display = self._format_account_display(account_record)
+
+            try:
+                self._activate_account_from_backup(account_num, data)
+                active_credentials = self._read_credentials()
+                if active_credentials is None:
+                    self._logger.warning(
+                        "Capacity probe Account-%s: cannot read credentials",
+                        account_num,
+                    )
+                    print(f"  Account-{account_num}: {display} — error (no credentials)")
+                    continue
+
+                access_token = self._extract_access_token(active_credentials)
+                if not access_token:
+                    self._logger.warning(
+                        "Capacity probe Account-%s: no access token", account_num
+                    )
+                    print(f"  Account-{account_num}: {display} — error (no token)")
+                    continue
+
+                usage = self._fetch_usage_for_token(access_token)
+                state = usage.get("state")
+                windows = usage.get("windows", {})
+                windows_line = self._render_windows_line(windows)
+                self._logger.debug(
+                    "Capacity probe Account-%s state=%s", account_num, state
+                )
+
+                if state == "ready":
+                    status_detail = "ready"
+                    if windows_line:
+                        status_detail += f" ({windows_line})"
+                    print(f"  Account-{account_num}: {display} — {status_detail}")
+                    return account_num, None
+
+                if state == "limited":
+                    reset_at = usage.get("rate_limited_until")
+                    reset_dt = self._parse_status_datetime(reset_at) if reset_at else None
+                    status_detail = "limited"
+                    if reset_dt is not None:
+                        remaining = int(
+                            (reset_dt - datetime.now(timezone.utc)).total_seconds()
+                        )
+                        eta = self._format_duration(max(remaining, 0))
+                        status_detail += f" (resets in {eta})"
+                    if windows_line:
+                        status_detail += f" — {windows_line}"
+                    print(f"  Account-{account_num}: {display} — {status_detail}")
+
+                    if best_limited is None or (
+                        reset_dt is not None
+                        and (
+                            best_limited[1] is None or reset_dt < best_limited[1]
+                        )
+                    ):
+                        best_limited = (account_num, reset_dt)
+                else:
+                    detail = usage.get("detail", state)
+                    print(f"  Account-{account_num}: {display} — {detail}")
+
+            except Exception as exc:
+                self._logger.warning(
+                    "Capacity probe failed for Account-%s: %s", account_num, exc
+                )
+                print(f"  Account-{account_num}: {display} — error ({exc})")
+                continue
+
+        print()
+
+        if best_limited is not None:
+            acct, reset_dt = best_limited
+            if reset_dt is not None:
+                remaining = int(
+                    (reset_dt - datetime.now(timezone.utc)).total_seconds()
+                )
+                eta = self._format_duration(max(remaining, 0))
+                return acct, (
+                    f"No accounts with capacity. Switching to Account-{acct} "
+                    f"(earliest reset in {eta})."
+                )
+            return acct, f"No accounts with capacity. Switching to Account-{acct} (soonest to reset)."
+
+        return None, "All accounts are at capacity and none could be probed."
+
     def _build_status_counts(self, accounts: list[dict[str, Any]]) -> dict[str, int]:
         """Count usage states across swept accounts."""
         counts = {"ready": 0, "limited": 0, "auth": 0, "other": 0}
@@ -1781,7 +1887,7 @@ class ClaudeAccountSwitcher:
             print("Only one account is managed. Add more accounts to switch between.")
             return
 
-        # Find current index and get next
+        # Find current index and build ordered candidate list
         try:
             current_index = sequence.index(int(current_account))
         except ValueError:
@@ -1792,16 +1898,35 @@ class ClaudeAccountSwitcher:
                 sequence,
             )
 
-        next_index = (current_index + 1) % len(sequence)
-        next_account = str(sequence[next_index])
+        candidates = [
+            str(sequence[(current_index + offset) % len(sequence)])
+            for offset in range(1, len(sequence))
+        ]
+
         self._logger.debug(
-            "Switch rotation current_account=%s next_account=%s sequence=%s",
+            "Switch rotation current_account=%s candidates=%s sequence=%s",
             current_account,
-            next_account,
+            candidates,
             sequence,
         )
 
-        self._perform_switch(next_account)
+        # Probe candidates for one with available capacity
+        with FileLock(self.lock_file):
+            snapshot = self._capture_active_state_snapshot(data)
+            try:
+                best_account, reason = self._find_ready_account(candidates, data)
+            finally:
+                self._restore_active_state_snapshot(snapshot, data)
+
+        if best_account is None:
+            print("All accounts are at capacity. No switch performed.")
+            print("Run 'cswap --status' to see reset times.")
+            return
+
+        if reason:
+            print(reason)
+
+        self._perform_switch(best_account)
 
     def switch_to(self, identifier: str) -> None:
         """Switch to specific account."""
@@ -1853,6 +1978,60 @@ class ClaudeAccountSwitcher:
             target_account,
             current_account,
         )
+
+        # Probe the target account's capacity before switching
+        target_record = data.get("accounts", {}).get(target_account, {})
+        display = self._format_account_display(target_record)
+        with FileLock(self.lock_file):
+            snapshot = self._capture_active_state_snapshot(data)
+            try:
+                self._activate_account_from_backup(target_account, data)
+                active_credentials = self._read_credentials()
+                access_token = (
+                    self._extract_access_token(active_credentials)
+                    if active_credentials
+                    else None
+                )
+                if access_token:
+                    usage = self._fetch_usage_for_token(access_token)
+                    state = usage.get("state")
+                    windows = usage.get("windows", {})
+                    windows_line = self._render_windows_line(windows)
+
+                    if state == "ready":
+                        status_detail = "ready"
+                        if windows_line:
+                            status_detail += f" ({windows_line})"
+                        print(f"Account-{target_account}: {display} — {status_detail}")
+                    elif state == "limited":
+                        reset_at = usage.get("rate_limited_until")
+                        reset_dt = (
+                            self._parse_status_datetime(reset_at) if reset_at else None
+                        )
+                        status_detail = "limited"
+                        if reset_dt is not None:
+                            remaining = int(
+                                (
+                                    reset_dt - datetime.now(timezone.utc)
+                                ).total_seconds()
+                            )
+                            eta = self._format_duration(max(remaining, 0))
+                            status_detail += f" (resets in {eta})"
+                        if windows_line:
+                            status_detail += f" — {windows_line}"
+                        print(
+                            f"Warning: Account-{target_account}: {display} — {status_detail}"
+                        )
+                    else:
+                        detail = usage.get("detail", state)
+                        print(f"Account-{target_account}: {display} — {detail}")
+            except Exception as exc:
+                self._logger.warning(
+                    "Capacity probe failed for Account-%s: %s", target_account, exc
+                )
+            finally:
+                self._restore_active_state_snapshot(snapshot, data)
+
         self._perform_switch(target_account)
 
     def _perform_switch(self, target_account: str) -> None:
