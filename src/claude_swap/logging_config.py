@@ -17,6 +17,7 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     """
     logger = logging.getLogger("claude-swap")
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.propagate = False
 
     # Clear any existing handlers
     logger.handlers.clear()
@@ -28,12 +29,14 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     log_file = log_dir / "claude-swap.log"
     file_handler = RotatingFileHandler(
         log_file,
-        maxBytes=1024 * 1024,  # 1MB
-        backupCount=3,
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=5,
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        logging.Formatter(
+            "%(asctime)s %(levelname)s [%(name)s:%(funcName)s:%(lineno)d] %(message)s"
+        )
     )
     logger.addHandler(file_handler)
 
@@ -41,7 +44,10 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     if debug:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.DEBUG)
-        console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        console_handler.setFormatter(
+            logging.Formatter("%(levelname)s [%(funcName)s:%(lineno)d] %(message)s")
+        )
         logger.addHandler(console_handler)
 
+    logger.debug("Logging initialized log_file=%s debug=%s", log_file, debug)
     return logger

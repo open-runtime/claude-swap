@@ -46,6 +46,12 @@ Examples:
         action="store_true",
         help="Show OAuth token expiry state (use with --list)",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Output status sweep as JSON (only with --status)",
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -88,6 +94,8 @@ Examples:
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with --list")
+    if args.as_json and not args.status:
+        parser.error("--json can only be used with --status")
 
     # Initialize switcher with debug mode
     switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -112,7 +120,7 @@ Examples:
         elif args.switch_to:
             switcher.switch_to(args.switch_to)
         elif args.status:
-            switcher.status()
+            switcher.status(as_json=args.as_json)
         elif args.purge:
             switcher.purge()
     except ClaudeSwitchError as e:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -117,3 +118,34 @@ class TestCLICommands:
             env={**subprocess.os.environ, "HOME": str(temp_home)},
         )
         assert "No accounts" in result.stdout or "managed" in result.stdout.lower()
+
+    def test_status_json_no_account(self, temp_home: Path):
+        """Test status JSON output with no active account."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--status", "--json"],
+            capture_output=True,
+            text=True,
+            env={**subprocess.os.environ, "HOME": str(temp_home)},
+        )
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["state"] == "no_active_account"
+        assert payload["original_active_account_number"] is None
+        assert payload["restored_active_account_number"] is None
+        assert payload["counts"] == {
+            "ready": 0,
+            "limited": 0,
+            "auth": 0,
+            "other": 0,
+        }
+
+    def test_json_flag_requires_status(self, temp_home: Path):
+        """Test --json is only accepted with --status."""
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--list", "--json"],
+            capture_output=True,
+            text=True,
+            env={**subprocess.os.environ, "HOME": str(temp_home)},
+        )
+        assert result.returncode != 0
+        assert "--json can only be used with --status" in result.stderr
