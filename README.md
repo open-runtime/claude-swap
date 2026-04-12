@@ -37,21 +37,11 @@ cswap --add-account
 
 ### Add more accounts
 
-Log out of Claude Code, log in with another account, then:
+Log in with another account, then:
 
 ```bash
 cswap --add-account
 ```
-
-### Refresh expired tokens
-
-If an account's token expires, log back into Claude Code with that account and re-run:
-
-```bash
-cswap --add-account
-```
-
-This will update the stored credentials without creating a duplicate.
 
 ### Switch accounts
 
@@ -70,14 +60,28 @@ cswap --switch-to user@example.com
 
 **Note:** Restart Claude Code after switching for the new account to take effect.
 
+### Refresh expired tokens
+
+If an account's token expires, log back into Claude Code with that account and re-run:
+
+```bash
+cswap --add-account
+```
+
+This will update the stored credentials without creating a duplicate.
+
 ### Other commands
 
 ```bash
-cswap --list              # List all accounts with usage stats
+cswap --list              # Show all accounts with 5h/7d usage and reset times
 cswap --status            # Show current account
 cswap --remove-account 2  # Remove an account
 cswap --purge             # Remove all claude-swap data
 ```
+
+## Tips
+
+- **Continuing sessions after switching:** You can resume the same Claude Code session after switching accounts. Close Claude Code (or the extension tab), run `cswap --switch`, then reopen and select your previous session. Note that the first message on the new account may use extra usage as the conversation cache rebuilds for that account.
 
 ## How it works
 

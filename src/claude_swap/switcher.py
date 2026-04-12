@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -27,18 +28,40 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
+from claude_swap import oauth
+from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import Platform, SwitchTransaction, get_timestamp
+from claude_swap.printer import (
+    abbreviate_path,
+    accent,
+    bold_accent,
+    bolded,
+    dimmed,
+    entrypoint_label,
+    error,
+    format_age,
+    ide_short_name,
+    muted,
+    warning,
+)
+from claude_swap.process_detection import get_running_instances
 
 # Service name for keyring storage
 KEYRING_SERVICE = "claude-code"
 KEYRING_ACTIVE_USERNAME = "active-credentials"
+
+# Usage cache
+_USAGE_CACHE_TTL = 15  # seconds
+
+# Status / usage API defaults
 DEFAULT_STATUS_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 DEFAULT_STATUS_USER_AGENT = "claude-code/2.1.77"
 DEFAULT_STATUS_BETA_HEADER = "oauth-2025-04-20"
 DEFAULT_STATUS_TIMEOUT_SECONDS = 20.0
 
+# OAuth refresh constants
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
@@ -104,27 +127,31 @@ class ClaudeAccountSwitcher:
         return False
 
     def _get_claude_config_path(self) -> Path:
-        """Get Claude configuration file path with fallback."""
+        """Get the Claude configuration file path for the current session.
+
+        Claude Code may write to either ~/.claude/.claude.json or ~/.claude.json
+        depending on version or context. When both files exist with oauthAccount,
+        return the more recently modified one as it represents the active session.
+        """
         primary_config = self.home / ".claude" / ".claude.json"
         fallback_config = self.home / ".claude.json"
 
-        if primary_config.exists():
-            try:
-                data = json.loads(primary_config.read_text())
-                if "oauthAccount" in data:
-                    self._logger.debug(
-                        "Using primary Claude config path: %s", primary_config
-                    )
-                    return primary_config
-            except (json.JSONDecodeError, KeyError):
-                self._logger.debug(
-                    "Primary Claude config exists but is not usable, falling back: %s",
-                    primary_config,
-                )
-                pass
+        candidates = []
+        for path in [primary_config, fallback_config]:
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if "oauthAccount" in data:
+                        candidates.append(path)
+                except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                    pass
 
-        self._logger.debug("Using fallback Claude config path: %s", fallback_config)
-        return fallback_config
+        if not candidates:
+            return fallback_config
+        if len(candidates) == 1:
+            return candidates[0]
+        # Both have oauthAccount — use the more recently modified one
+        return max(candidates, key=lambda p: p.stat().st_mtime)
 
     def _validate_email(self, email: str) -> bool:
         """Validate email format."""
@@ -144,7 +171,7 @@ class ClaudeAccountSwitcher:
             self._logger.debug("JSON file does not exist: %s", path)
             return None
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 self._logger.debug(
                     "Read JSON file %s with top-level keys=%s",
@@ -158,7 +185,7 @@ class ClaudeAccountSwitcher:
                     type(data).__name__,
                 )
             return data
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self._logger.warning(f"Invalid JSON in {path}")
             return None
 
@@ -173,11 +200,11 @@ class ClaudeAccountSwitcher:
 
         # Write to temp file first
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content)
+        temp_path.write_text(content, encoding="utf-8")
 
         # Validate written content
         try:
-            json.loads(temp_path.read_text())
+            json.loads(temp_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             temp_path.unlink()
             raise ConfigError("Generated invalid JSON")
@@ -187,6 +214,10 @@ class ClaudeAccountSwitcher:
         if sys.platform != "win32":
             os.chmod(path, 0o600)
         self._logger.debug("Wrote JSON file %s (%s bytes)", path, len(content))
+
+    # ------------------------------------------------------------------ #
+    #  Identity & debug helpers (fork additions)                          #
+    # ------------------------------------------------------------------ #
 
     def _normalize_email(self, email: str) -> str:
         """Normalize email for comparisons."""
@@ -207,11 +238,11 @@ class ClaudeAccountSwitcher:
         summary = [f"state=json type={type(parsed).__name__}", f"length={len(payload)}"]
         if isinstance(parsed, dict):
             summary.append(f"json_keys={sorted(parsed.keys())}")
-            oauth = parsed.get("claudeAiOauth")
-            if isinstance(oauth, dict):
-                summary.append(f"claudeAiOauth_keys={sorted(oauth.keys())}")
-                access_token = oauth.get("accessToken")
-                refresh_token = oauth.get("refreshToken")
+            oauth_data = parsed.get("claudeAiOauth")
+            if isinstance(oauth_data, dict):
+                summary.append(f"claudeAiOauth_keys={sorted(oauth_data.keys())}")
+                access_token = oauth_data.get("accessToken")
+                refresh_token = oauth_data.get("refreshToken")
                 if isinstance(access_token, str):
                     summary.append(f"accessToken_length={len(access_token)}")
                 if isinstance(refresh_token, str):
@@ -282,6 +313,10 @@ class ClaudeAccountSwitcher:
             return f"{email} [{label}]"
         return email
 
+    # ------------------------------------------------------------------ #
+    #  Time / duration formatting (fork additions)                        #
+    # ------------------------------------------------------------------ #
+
     def _parse_status_datetime(self, value: str | None) -> datetime | None:
         """Parse status timestamps and normalize naive datetimes to UTC."""
         if not value:
@@ -293,164 +328,6 @@ class ClaudeAccountSwitcher:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed
-
-    def _parse_credential_payload(self, credentials: str | None) -> dict[str, Any] | None:
-        """Parse Claude credential JSON and return oauth payload if present."""
-        if not credentials:
-            return None
-        try:
-            payload = json.loads(credentials)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(payload, dict):
-            return None
-
-        oauth = payload.get("claudeAiOauth")
-        if isinstance(oauth, dict):
-            return oauth
-        return payload
-
-    def _extract_access_token(self, credentials: str | None) -> str | None:
-        """Extract access token from Claude credentials."""
-        oauth = self._parse_credential_payload(credentials)
-        if not oauth:
-            return None
-        token = oauth.get("accessToken")
-        return token if isinstance(token, str) and token else None
-
-    def _is_oauth_token_expired(self, credentials: str | None) -> bool:
-        """Check if the OAuth token in credentials is expired or about to expire."""
-        oauth = self._parse_credential_payload(credentials)
-        if not oauth:
-            return False
-        expires_at = oauth.get("expiresAt")
-        if not isinstance(expires_at, (int, float)):
-            return False
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
-
-    def _refresh_oauth_credentials(self, credentials: str) -> str | None:
-        """Refresh an OAuth access token via the platform token endpoint."""
-        try:
-            data = json.loads(credentials)
-            oauth = data.get("claudeAiOauth")
-            if not isinstance(oauth, dict):
-                return None
-
-            refresh_token = oauth.get("refreshToken")
-            if not refresh_token:
-                return None
-
-            scopes = oauth.get("scopes")
-            if not isinstance(scopes, list) or not scopes:
-                self._logger.debug("OAuth refresh skipped: scopes missing")
-                return None
-
-            body = json.dumps({
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": OAUTH_CLIENT_ID,
-                "scope": " ".join(scopes),
-            }).encode()
-
-            req = request.Request(
-                OAUTH_TOKEN_URL,
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with request.urlopen(req, timeout=10) as resp:
-                resp_data = json.loads(resp.read().decode())
-
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            oauth["accessToken"] = resp_data["access_token"]
-            oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
-            if resp_data.get("refresh_token"):
-                oauth["refreshToken"] = resp_data["refresh_token"]
-            if resp_data.get("scope"):
-                oauth["scopes"] = resp_data["scope"].split()
-
-            data["claudeAiOauth"] = oauth
-            return json.dumps(data)
-        except Exception as exc:
-            self._logger.debug("OAuth refresh failed: %r", exc)
-            return None
-
-    def _ensure_fresh_credentials(
-        self, account_num: str, email: str, credentials: str
-    ) -> tuple[str, str | None]:
-        """Return (credentials, access_token) after refreshing if expired.
-
-        If the token is expired and refresh succeeds, the refreshed credentials
-        are persisted to backup storage. Returns the working credentials and
-        the extracted access token (or None if no usable token).
-        """
-        access_token = self._extract_access_token(credentials)
-
-        if access_token and not self._is_oauth_token_expired(credentials):
-            return credentials, access_token
-
-        if not self._is_oauth_token_expired(credentials):
-            return credentials, access_token
-
-        self._logger.debug(
-            "OAuth token expired for Account-%s, attempting refresh", account_num
-        )
-        refreshed = self._refresh_oauth_credentials(credentials)
-        if refreshed:
-            self._write_account_credentials(account_num, email, refreshed)
-            self._logger.info(
-                "Refreshed OAuth token for Account-%s", account_num
-            )
-            return refreshed, self._extract_access_token(refreshed)
-
-        return credentials, access_token
-
-    def _normalize_expires_at(self, value: Any) -> str | None:
-        """Convert credential expiry values to ISO timestamps when possible."""
-        if not isinstance(value, (int, float)):
-            return None
-
-        raw = float(value)
-        if raw > 1_000_000_000_000:
-            raw = raw / 1000.0
-        try:
-            return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
-        except (OverflowError, OSError, ValueError):
-            return None
-
-    def _credential_metadata(self, credentials: str | None) -> dict[str, Any]:
-        """Build safe credential metadata for status output."""
-        oauth = self._parse_credential_payload(credentials) or {}
-        token = oauth.get("accessToken")
-        scopes_raw = oauth.get("scopes")
-        scopes = (
-            [scope for scope in scopes_raw if isinstance(scope, str)]
-            if isinstance(scopes_raw, list)
-            else []
-        )
-        return {
-            "access_token_present": isinstance(token, str) and bool(token),
-            "access_token_suffix": token[-6:] if isinstance(token, str) and token else None,
-            "subscription_type": (
-                str(oauth.get("subscriptionType")) if oauth.get("subscriptionType") else None
-            ),
-            "scopes": scopes,
-            "expires_at": self._normalize_expires_at(oauth.get("expiresAt")),
-        }
-
-    def _human_window_name(self, name: str) -> str:
-        """Format usage window names for human output."""
-        mapping = {
-            "extra_usage": "extra usage",
-            "five_hour": "5h",
-            "seven_day": "7d",
-            "seven_day_cowork": "7d cowork",
-            "seven_day_sonnet": "7d sonnet",
-            "seven_day_opus": "7d opus",
-            "seven_day_oauth_apps": "7d oauth apps",
-        }
-        return mapping.get(name, name.replace("_", " "))
 
     def _format_timestamp(self, value: str | None) -> str | None:
         """Render ISO timestamps in UTC for user-facing output."""
@@ -489,6 +366,172 @@ class ClaudeAccountSwitcher:
         if remaining <= 0:
             return "now"
         return self._format_duration(remaining)
+
+    def _normalize_expires_at(self, value: Any) -> str | None:
+        """Convert credential expiry values to ISO timestamps when possible."""
+        if not isinstance(value, (int, float)):
+            return None
+
+        raw = float(value)
+        if raw > 1_000_000_000_000:
+            raw = raw / 1000.0
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    # ------------------------------------------------------------------ #
+    #  OAuth token management (fork additions)                            #
+    # ------------------------------------------------------------------ #
+
+    def _parse_credential_payload(self, credentials: str | None) -> dict[str, Any] | None:
+        """Parse Claude credential JSON and return oauth payload if present."""
+        if not credentials:
+            return None
+        try:
+            payload = json.loads(credentials)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        oauth_data = payload.get("claudeAiOauth")
+        if isinstance(oauth_data, dict):
+            return oauth_data
+        return payload
+
+    def _extract_access_token(self, credentials: str | None) -> str | None:
+        """Extract access token from Claude credentials."""
+        oauth_data = self._parse_credential_payload(credentials)
+        if not oauth_data:
+            return None
+        token = oauth_data.get("accessToken")
+        return token if isinstance(token, str) and token else None
+
+    def _is_oauth_token_expired(self, credentials: str | None) -> bool:
+        """Check if the OAuth token in credentials is expired or about to expire."""
+        oauth_data = self._parse_credential_payload(credentials)
+        if not oauth_data:
+            return False
+        expires_at = oauth_data.get("expiresAt")
+        if not isinstance(expires_at, (int, float)):
+            return False
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+
+    def _refresh_oauth_credentials(self, credentials: str) -> str | None:
+        """Refresh an OAuth access token via the platform token endpoint."""
+        try:
+            data = json.loads(credentials)
+            oauth_data = data.get("claudeAiOauth")
+            if not isinstance(oauth_data, dict):
+                return None
+
+            refresh_token = oauth_data.get("refreshToken")
+            if not refresh_token:
+                return None
+
+            scopes = oauth_data.get("scopes")
+            if not isinstance(scopes, list) or not scopes:
+                self._logger.debug("OAuth refresh skipped: scopes missing")
+                return None
+
+            body = json.dumps({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": OAUTH_CLIENT_ID,
+                "scope": " ".join(scopes),
+            }).encode()
+
+            req = request.Request(
+                OAUTH_TOKEN_URL,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with request.urlopen(req, timeout=10) as resp:
+                resp_data = json.loads(resp.read().decode())
+
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            oauth_data["accessToken"] = resp_data["access_token"]
+            oauth_data["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
+            if resp_data.get("refresh_token"):
+                oauth_data["refreshToken"] = resp_data["refresh_token"]
+            if resp_data.get("scope"):
+                oauth_data["scopes"] = resp_data["scope"].split()
+
+            data["claudeAiOauth"] = oauth_data
+            return json.dumps(data)
+        except Exception as exc:
+            self._logger.debug("OAuth refresh failed: %r", exc)
+            return None
+
+    def _ensure_fresh_credentials(
+        self, account_num: str, email: str, credentials: str
+    ) -> tuple[str, str | None]:
+        """Return (credentials, access_token) after refreshing if expired.
+
+        If the token is expired and refresh succeeds, the refreshed credentials
+        are persisted to backup storage. Returns the working credentials and
+        the extracted access token (or None if no usable token).
+        """
+        access_token = self._extract_access_token(credentials)
+
+        if access_token and not self._is_oauth_token_expired(credentials):
+            return credentials, access_token
+
+        if not self._is_oauth_token_expired(credentials):
+            return credentials, access_token
+
+        self._logger.debug(
+            "OAuth token expired for Account-%s, attempting refresh", account_num
+        )
+        refreshed = self._refresh_oauth_credentials(credentials)
+        if refreshed:
+            self._write_account_credentials(account_num, email, refreshed)
+            self._logger.info(
+                "Refreshed OAuth token for Account-%s", account_num
+            )
+            return refreshed, self._extract_access_token(refreshed)
+
+        return credentials, access_token
+
+    def _credential_metadata(self, credentials: str | None) -> dict[str, Any]:
+        """Build safe credential metadata for status output."""
+        oauth_data = self._parse_credential_payload(credentials) or {}
+        token = oauth_data.get("accessToken")
+        scopes_raw = oauth_data.get("scopes")
+        scopes = (
+            [scope for scope in scopes_raw if isinstance(scope, str)]
+            if isinstance(scopes_raw, list)
+            else []
+        )
+        return {
+            "access_token_present": isinstance(token, str) and bool(token),
+            "access_token_suffix": token[-6:] if isinstance(token, str) and token else None,
+            "subscription_type": (
+                str(oauth_data.get("subscriptionType")) if oauth_data.get("subscriptionType") else None
+            ),
+            "scopes": scopes,
+            "expires_at": self._normalize_expires_at(oauth_data.get("expiresAt")),
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Usage API (fork additions)                                         #
+    # ------------------------------------------------------------------ #
+
+    def _human_window_name(self, name: str) -> str:
+        """Format usage window names for human output."""
+        mapping = {
+            "extra_usage": "extra usage",
+            "five_hour": "5h",
+            "seven_day": "7d",
+            "seven_day_cowork": "7d cowork",
+            "seven_day_sonnet": "7d sonnet",
+            "seven_day_opus": "7d opus",
+            "seven_day_oauth_apps": "7d oauth apps",
+        }
+        return mapping.get(name, name.replace("_", " "))
 
     def _render_windows_line(self, windows: dict[str, Any]) -> str | None:
         """Render a compact human summary of usage windows."""
@@ -645,6 +688,10 @@ class ClaudeAccountSwitcher:
                 "source": "usage_api",
                 "raw": {},
             }
+
+    # ------------------------------------------------------------------ #
+    #  Identity matching & account resolution (fork additions)            #
+    # ------------------------------------------------------------------ #
 
     def _read_identity_from_config_path(
         self, config_path: Path, source: str
@@ -836,6 +883,10 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
 
+    # ------------------------------------------------------------------ #
+    #  Status sweep system (fork additions)                               #
+    # ------------------------------------------------------------------ #
+
     def _capture_active_state_snapshot(self, data: dict) -> dict[str, Any]:
         """Capture the currently active Claude auth state for later restoration."""
         current_identity = self._get_current_account_identity()
@@ -851,7 +902,7 @@ class ClaudeAccountSwitcher:
 
         config_path = self._get_claude_config_path()
         try:
-            current_config = config_path.read_text()
+            current_config = config_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             raise ConfigError("Claude config file not found")
         except PermissionError:
@@ -888,7 +939,7 @@ class ClaudeAccountSwitcher:
         self._write_credentials(snapshot["credentials"])
 
         config_path = snapshot["config_path"]
-        config_path.write_text(snapshot["config"])
+        config_path.write_text(snapshot["config"], encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(config_path, 0o600)
 
@@ -975,8 +1026,7 @@ class ClaudeAccountSwitcher:
         """Probe candidate accounts and return the first with available capacity.
 
         Returns (account_number, reason) where reason is a human message when
-        no ready account is found.  The caller must already hold the file lock
-        and must restore the active state afterwards.
+        no ready account is found.
         """
         best_limited: tuple[str, datetime | None] | None = None
 
@@ -1396,6 +1446,10 @@ class ClaudeAccountSwitcher:
                 "accounts": accounts_payload,
             }
 
+    # ------------------------------------------------------------------ #
+    #  Credential I/O (upstream with debug logging)                       #
+    # ------------------------------------------------------------------ #
+
     def _read_credentials(self) -> str | None:
         """Read credentials from Claude Code's storage.
 
@@ -1442,7 +1496,7 @@ class ClaudeAccountSwitcher:
             cred_file = self.home / ".claude" / ".credentials.json"
             if cred_file.exists():
                 try:
-                    credentials = cred_file.read_text()
+                    credentials = cred_file.read_text(encoding="utf-8")
                     self._logger.debug(
                         "Read active credentials file %s summary: %s",
                         cred_file,
@@ -1495,14 +1549,28 @@ class ClaudeAccountSwitcher:
             cred_dir.mkdir(parents=True, exist_ok=True)
             cred_file = cred_dir / ".credentials.json"
             try:
-                cred_file.write_text(credentials)
-                if sys.platform != "win32":
-                    os.chmod(cred_file, 0o600)
-                self._logger.debug(
-                    "Wrote active credentials file %s summary: %s",
-                    cred_file,
-                    self._describe_secret_payload(credentials),
-                )
+                import tempfile
+                fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
+                try:
+                    os.write(fd, credentials.encode("utf-8"))
+                    os.close(fd)
+                    fd = -1
+                    os.replace(tmp_path, str(cred_file))
+                    if sys.platform != "win32":
+                        os.chmod(str(cred_file), 0o600)
+                    self._logger.debug(
+                        "Wrote active credentials file %s summary: %s",
+                        cred_file,
+                        self._describe_secret_payload(credentials),
+                    )
+                except BaseException:
+                    if fd >= 0:
+                        os.close(fd)
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
             except Exception as e:
                 raise CredentialWriteError(f"Failed to write credentials: {e}")
 
@@ -1516,7 +1584,7 @@ class ClaudeAccountSwitcher:
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             if cred_file.exists():
                 try:
-                    encoded = cred_file.read_text()
+                    encoded = cred_file.read_text(encoding="utf-8")
                     credentials = base64.b64decode(encoded).decode("utf-8")
                     self._logger.debug(
                         "Read backup credentials file %s for Account-%s summary: %s",
@@ -1567,7 +1635,7 @@ class ClaudeAccountSwitcher:
             cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
             try:
                 encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-                cred_file.write_text(encoded)
+                cred_file.write_text(encoded, encoding="utf-8")
                 os.chmod(cred_file, 0o600)
                 self._logger.debug(
                     "Wrote backup credentials file %s for Account-%s",
@@ -1576,6 +1644,7 @@ class ClaudeAccountSwitcher:
                 )
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials file: {e}")
+                raise
         else:
             # Use keyring for macOS/Windows
             username = f"account-{account_num}-{email}"
@@ -1586,6 +1655,7 @@ class ClaudeAccountSwitcher:
                 )
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials to keyring: {e}")
+                raise
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup.
@@ -1622,7 +1692,7 @@ class ClaudeAccountSwitcher:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
-            content = config_file.read_text()
+            content = config_file.read_text(encoding="utf-8")
             self._logger.debug(
                 "Read backup config %s for Account-%s (%s bytes)",
                 config_file,
@@ -1640,7 +1710,7 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.write_text(config)
+        config_file.write_text(config, encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(config_file, 0o600)
         self._logger.debug(
@@ -1649,6 +1719,10 @@ class ClaudeAccountSwitcher:
             account_num,
             len(config),
         )
+
+    # ------------------------------------------------------------------ #
+    #  Sequence / account management (upstream)                           #
+    # ------------------------------------------------------------------ #
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
@@ -1686,95 +1760,179 @@ class ClaudeAccountSwitcher:
         account_nums = [int(k) for k in data["accounts"].keys()]
         return max(account_nums, default=0) + 1
 
-    def _get_current_account(self) -> str | None:
-        """Get current account email from .claude.json.
+    def _get_current_account(self) -> tuple[str, str] | None:
+        """Get current account identity (email, organization_uuid) from .claude.json.
 
         Returns:
-            Email address if found, None otherwise.
+            (email, organization_uuid) tuple if found, None otherwise.
+            organization_uuid is "" for personal accounts.
         """
-        identity = self._get_current_account_identity()
-        email = identity.get("email") if identity else None
-        self._logger.debug("Current account email lookup returned: %s", email)
-        return email or None
+        config_path = self._get_claude_config_path()
+        if not config_path.exists():
+            return None
 
-    def _account_exists(self, target: str | dict[str, str]) -> bool:
-        """Check if account exists by identity or email."""
+        data = self._read_json(config_path)
+        if not data:
+            return None
+
+        oauth_data = data.get("oauthAccount", {})
+        email = oauth_data.get("emailAddress", "")
+        if not email:
+            return None
+
+        organization_uuid = oauth_data.get("organizationUuid", "") or ""
+        return (email, organization_uuid)
+
+    def _account_exists(self, email: str, organization_uuid: str) -> bool:
+        """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
         if not data:
             return False
 
-        if isinstance(target, str):
-            normalized_target = self._normalize_email(target)
-            exists = any(
-                self._normalize_email(str(account.get("email") or ""))
-                == normalized_target
-                for account in data.get("accounts", {}).values()
-            )
-            self._logger.debug(
-                "Account existence email lookup target=%s exists=%s",
-                target,
-                exists,
-            )
-            return exists
+        for account in data.get("accounts", {}).values():
+            if (account.get("email") == email and
+                    account.get("organizationUuid", "") == organization_uuid):
+                return True
+        return False
 
-        target_identity = target
-        exists = self._find_matching_account_number(target_identity, data) is not None
-        self._logger.debug(
-            "Account existence target=%s exists=%s",
-            self._format_identity(self._extract_identity(target_identity)),
-            exists,
-        )
-        return exists
+    @staticmethod
+    def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
+        """Return display tag for an account's org context."""
+        return org_name if org_name else "personal"
 
     def _resolve_account_identifier(self, identifier: str) -> str | None:
-        """Resolve account identifier (number or email) to account number."""
+        """Resolve account identifier (number or email) to account number.
+
+        Raises:
+            ConfigError: if the email matches multiple accounts (ambiguous).
+        """
         if identifier.isdigit():
-            self._logger.debug(
-                "Resolved numeric account identifier directly: %s", identifier
-            )
             return identifier
 
         data = self._get_sequence_data()
         if not data:
             return None
 
-        matches = []
-        for num, account in data.get("accounts", {}).items():
-            if self._normalize_email(account.get("email", "")) == self._normalize_email(
-                identifier
-            ):
-                matches.append(num)
+        matches = [
+            num for num, account in data.get("accounts", {}).items()
+            if account.get("email") == identifier
+        ]
 
-        self._logger.debug(
-            "Resolved email identifier=%s matches=%s", identifier, matches
-        )
-        if len(matches) > 1:
-            raise ValidationError(
-                f"Email '{identifier}' matches multiple managed accounts. "
-                "Use the account number instead."
-            )
-        if matches:
+        if len(matches) == 0:
+            return None
+        if len(matches) == 1:
             return matches[0]
-        return None
+
+        details = ", ".join(
+            f"{num} [{data['accounts'][num].get('organizationName') or 'personal'}]"
+            for num in matches
+        )
+        raise ConfigError(
+            f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
+            f"Use account number instead (e.g., cswap --switch-to 1)."
+        )
+
+    def _get_sequence_data_migrated(self) -> dict | None:
+        """Get sequence data, ensuring org-field migration has run."""
+        data = self._get_sequence_data()
+        if not data:
+            return data
+        needs_migration = any(
+            "organizationUuid" not in acc
+            for acc in data.get("accounts", {}).values()
+        )
+        if needs_migration:
+            self._migrate_org_fields()
+            data = self._get_sequence_data()  # Re-read after migration
+        return data
+
+    def _migrate_org_fields(self) -> None:
+        """Backfill organizationUuid/Name for accounts added before org support.
+
+        For the currently active account, reads org info from the live config
+        (which is authoritative). For inactive accounts, falls back to backup
+        configs. Writes updated fields back to sequence.json.
+        """
+        data = self._get_sequence_data()
+        if not data:
+            return
+
+        # Read live config for the currently active account
+        live_email = ""
+        live_org_uuid = ""
+        live_org_name = ""
+        config_path = self._get_claude_config_path()
+        if config_path.exists():
+            try:
+                config_data = self._read_json(config_path)
+                if config_data:
+                    oauth_data = config_data.get("oauthAccount", {})
+                    live_email = oauth_data.get("emailAddress", "")
+                    live_org_uuid = oauth_data.get("organizationUuid", "") or ""
+                    live_org_name = oauth_data.get("organizationName", "") or ""
+            except Exception:
+                pass
+
+        updated = False
+        for num, account in data.get("accounts", {}).items():
+            if "organizationUuid" in account:
+                continue  # Already migrated
+
+            email = account.get("email", "")
+
+            # For the active account, prefer live config (backup may lack org fields)
+            if email == live_email and live_email:
+                account["organizationUuid"] = live_org_uuid
+                account["organizationName"] = live_org_name
+                updated = True
+                continue
+
+            # For inactive accounts, fall back to backup config
+            config_text = self._read_account_config(num, email)
+            if config_text:
+                try:
+                    config_data = json.loads(config_text)
+                    oauth_data = config_data.get("oauthAccount", {})
+                    account["organizationUuid"] = oauth_data.get("organizationUuid", "") or ""
+                    account["organizationName"] = oauth_data.get("organizationName", "") or ""
+                except (json.JSONDecodeError, AttributeError):
+                    account["organizationUuid"] = ""
+                    account["organizationName"] = ""
+            else:
+                account["organizationUuid"] = ""
+                account["organizationName"] = ""
+            updated = True
+
+        if updated:
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+
+    # ------------------------------------------------------------------ #
+    #  Public account operations (upstream)                               #
+    # ------------------------------------------------------------------ #
 
     def add_account(self) -> None:
         """Add current account to managed accounts."""
         self._setup_directories()
         self._init_sequence_file()
+        self._migrate_org_fields()
 
-        current_identity = self._get_current_account_identity()
-        current_email = current_identity.get("email") if current_identity else None
-        if not current_email:
+        identity = self._get_current_account()
+        if identity is None:
             raise ConfigError("No active Claude account found. Please log in first.")
+        current_email, current_org_uuid = identity
 
-        data = self._get_sequence_data()
-        existing_account = self._find_matching_account_number(current_identity, data)
-        if existing_account:
-            self._logger.info(
-                "Refreshing credentials for Account-%s: %s",
-                existing_account,
-                self._format_identity(current_identity),
+        if self._account_exists(current_email, current_org_uuid):
+            # Refresh credentials for existing account using composite key lookup
+            seq = self._get_sequence_data()
+            account_num = next(
+                (num for num, acc in seq.get("accounts", {}).items()
+                 if acc.get("email") == current_email and
+                 acc.get("organizationUuid", "") == current_org_uuid),
+                None,
             )
+            matched_org_name = seq["accounts"][account_num].get("organizationName", "") if account_num else ""
+
             current_creds = self._read_credentials()
             if current_creds is None:
                 raise CredentialReadError("Failed to read credentials for current account")
@@ -1783,32 +1941,29 @@ class ClaudeAccountSwitcher:
 
             config_path = self._get_claude_config_path()
             try:
-                current_config = config_path.read_text()
+                current_config = config_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
             except PermissionError:
                 raise ConfigError("Permission denied reading Claude config")
 
-            self._write_account_credentials(existing_account, current_email, current_creds)
-            self._write_account_config(existing_account, current_email, current_config)
+            self._write_account_credentials(account_num, current_email, current_creds)
+            self._write_account_config(account_num, current_email, current_config)
 
-            data["activeAccountNumber"] = int(existing_account)
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            # Update active account
+            seq["activeAccountNumber"] = int(account_num)
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
 
-            self._logger.info(f"Updated credentials for Account-{existing_account}: {current_email}")
+            tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
+            self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
             print(
-                f"Updated credentials for Account-{existing_account}: "
-                f"{self._format_account_display(current_identity)}"
+                f"{accent('Updated credentials')} for Account {account_num} "
+                f"({current_email} {muted(f'[{tag}]')})."
             )
             return
 
         account_num = str(self._get_next_account_number())
-        self._logger.debug(
-            "Adding new managed account Account-%s identity=%s",
-            account_num,
-            self._format_identity(current_identity),
-        )
 
         # Backup current credentials and config
         current_creds = self._read_credentials()
@@ -1816,21 +1971,21 @@ class ClaudeAccountSwitcher:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
-        self._logger.debug(
-            "Current credential snapshot summary before add: %s",
-            self._describe_secret_payload(current_creds),
-        )
 
         config_path = self._get_claude_config_path()
         try:
-            current_config = config_path.read_text()
+            current_config = config_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             raise ConfigError("Claude config file not found")
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
-        self._logger.debug(
-            "Read current config for add from %s (%s bytes)", config_path, len(current_config)
-        )
+
+        # Get account UUID and org fields
+        config_data = self._read_json(config_path)
+        oauth_data = config_data.get("oauthAccount", {})
+        account_uuid = oauth_data.get("accountUuid", "")
+        organization_uuid = oauth_data.get("organizationUuid", "") or ""
+        organization_name = oauth_data.get("organizationName", "") or ""
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
@@ -1838,48 +1993,56 @@ class ClaudeAccountSwitcher:
 
         # Update sequence.json
         data = self._get_sequence_data()
-        account_record = {
+        data["accounts"][account_num] = {
             "email": current_email,
+            "uuid": account_uuid,
+            "organizationUuid": organization_uuid,
+            "organizationName": organization_name,
             "added": get_timestamp(),
         }
-        if current_identity:
-            if current_identity.get("uuid"):
-                account_record["uuid"] = current_identity["uuid"]
-            if current_identity.get("organizationUuid"):
-                account_record["organizationUuid"] = current_identity["organizationUuid"]
-            if current_identity.get("displayName"):
-                account_record["displayName"] = current_identity["displayName"]
-            if current_identity.get("organizationName"):
-                account_record["organizationName"] = current_identity["organizationName"]
-            if current_identity.get("billingType"):
-                account_record["billingType"] = current_identity["billingType"]
-
-        self._logger.debug(
-            "Persisting managed account record Account-%s: %s",
-            account_num,
-            account_record,
-        )
-        data["accounts"][account_num] = account_record
         data["sequence"].append(int(account_num))
         data["activeAccountNumber"] = int(account_num)
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        self._logger.info(f"Added account {account_num}: {current_email}")
-        print(
-            f"Added Account {account_num}: "
-            f"{self._format_account_display(account_record)}"
-        )
+        tag = self._get_display_tag(current_email, organization_name, organization_uuid)
+        self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+        print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def remove_account(self, identifier: str) -> None:
         """Remove account from managed accounts."""
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
+        # Ensure org fields are migrated before resolving accounts
+        self._get_sequence_data_migrated()
+
         # Resolve identifier
         if not identifier.isdigit():
             if not self._validate_email(identifier):
                 raise ValidationError(f"Invalid email format: {identifier}")
+
+            # For email identifiers, handle ambiguous matches interactively
+            data = self._get_sequence_data()
+            matches = [
+                num for num, acc in (data or {}).get("accounts", {}).items()
+                if acc.get("email") == identifier
+            ]
+            if len(matches) > 1:
+                print(f"Multiple accounts found for '{identifier}':")
+                for num in matches:
+                    acc = data["accounts"][num]
+                    tag = self._get_display_tag(
+                        acc.get("email", ""),
+                        acc.get("organizationName", ""),
+                        acc.get("organizationUuid", ""),
+                    )
+                    print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
+                choice = input("Enter account number to remove: ").strip()
+                if not choice.isdigit() or choice not in matches:
+                    print(dimmed("Cancelled"))
+                    return
+                identifier = choice
 
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
@@ -1895,22 +2058,16 @@ class ClaudeAccountSwitcher:
 
         email = account_info.get("email")
         active_account = data.get("activeAccountNumber")
-        self._logger.debug(
-            "Removing Account-%s info=%s activeAccountNumber=%s",
-            account_num,
-            account_info,
-            active_account,
-        )
 
         if str(active_account) == account_num:
-            print(f"Warning: Account-{account_num} ({email}) is currently active")
+            warning(f"Warning: Account-{account_num} ({email}) is currently active")
 
         confirm = input(
             f"Are you sure you want to permanently remove "
             f"Account-{account_num} ({email})? [y/N] "
         )
         if confirm.lower() != "y":
-            print("Cancelled")
+            print(dimmed("Cancelled"))
             return
 
         # Remove backup files
@@ -1926,115 +2083,248 @@ class ClaudeAccountSwitcher:
 
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
-        print(f"Account-{account_num} ({email}) has been removed")
+        print(f"{accent('Removed')} Account-{account_num} ({email})")
 
-    def list_accounts(self) -> None:
+    def list_accounts(
+        self,
+        show_token_status: bool = False,
+    ) -> None:
         """List all managed accounts."""
         if not self.sequence_file.exists():
-            print("No accounts are managed yet.")
+            print(dimmed("No accounts are managed yet."))
             self._first_run_setup()
             return
 
-        data = self._get_sequence_data()
-        current_identity = self._get_current_account_identity()
+        data = self._get_sequence_data_migrated()
+        current_identity = self._get_current_account()
 
-        active_num = self._find_matching_account_number(current_identity, data)
-        if active_num is not None:
-            self._sync_active_account_number(data, active_num)
+        # Find active account number by (email, organizationUuid) composite key
+        active_num = None
+        if current_identity is not None:
+            current_email, current_org_uuid = current_identity
+            for num, account in data.get("accounts", {}).items():
+                if (account.get("email") == current_email and
+                        account.get("organizationUuid", "") == current_org_uuid):
+                    active_num = num
+                    break
 
-        self._logger.debug(
-            "Listing managed accounts active_num=%s current_identity=%s",
-            active_num,
-            self._format_identity(current_identity),
-        )
-
-        print("Accounts:")
+        accounts_info = []
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
-            display = self._format_account_display(account)
-            self._logger.debug(
-                "List entry Account-%s record=%s", num, self._format_identity(self._extract_identity(account))
-            )
-            if str(num) == active_num:
-                print(f"  {num}: {display} (active)")
+            email = account.get("email", "unknown")
+            org_name = account.get("organizationName", "") or ""
+            org_uuid = account.get("organizationUuid", "") or ""
+            is_active = str(num) == active_num
+
+            if is_active:
+                creds = self._read_credentials() or ""
             else:
-                print(f"  {num}: {display}")
+                creds = self._read_account_credentials(str(num), email)
+
+            accounts_info.append((num, email, org_name, org_uuid, is_active, creds))
+
+        def fetch(
+            account_info: tuple[int, str, str, str, bool, str]
+        ) -> dict | str | None:
+            num, email, _, _, is_active, creds = account_info
+            if not creds or not oauth.extract_access_token(creds):
+                return "no credentials"
+
+            def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
+                with FileLock(self.lock_file):
+                    self._write_account_credentials(acct_num, acct_email, new_creds)
+
+            return oauth.fetch_usage_for_account(
+                str(num), email, creds,
+                is_active=is_active,
+                persist_credentials=persist,
+            )
+
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+        account_keys = {str(info[0]) for info in accounts_info}
+        if cached is not MISSING and isinstance(cached, dict) and cached.keys() == account_keys:
+            usages = [cached.get(str(info[0])) for info in accounts_info]
+        else:
+            with ThreadPoolExecutor() as executor:
+                usages = list(executor.map(fetch, accounts_info))
+            write_cache(usage_cache_path, {
+                str(info[0]): usage
+                for info, usage in zip(accounts_info, usages)
+            })
+
+        print(bolded("Accounts:"))
+        for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
+            tag = self._get_display_tag(email, org_name, org_uuid)
+            if is_active:
+                marker = f" {bold_accent('(active)')}"
+                print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
+            else:
+                print(f"  {num}: {email} {muted(f'[{tag}]')}")
+            if isinstance(usage, str):
+                print(f"     {dimmed(usage)}")
+            elif usage is None:
+                print(f"     {dimmed('usage unavailable')}")
+            else:
+                h5 = usage.get("five_hour")
+                d7 = usage.get("seven_day")
+                lines = []
+                if h5:
+                    if "clock" in h5:
+                        lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
+                    else:
+                        lines.append(f"5h: {h5['pct']:>3.0f}%")
+                if d7:
+                    if "clock" in d7:
+                        lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
+                    else:
+                        lines.append(f"7d: {d7['pct']:>3.0f}%")
+                for j, line in enumerate(lines):
+                    connector = "└" if j == len(lines) - 1 else "├"
+                    print(f"     {dimmed(connector)} {muted(line)}")
+
+            if show_token_status:
+                token_status = oauth.build_token_status(accounts_info[i][5])
+                if token_status:
+                    print(f"     {dimmed('•')} {muted(token_status)}")
+            if i < len(accounts_info) - 1:
+                print()
+
+        # Running instances
+        try:
+            sessions, ide_instances = get_running_instances()
+
+            if sessions or ide_instances:
+                # Group by (label, folder) to avoid repetitive lines
+                groups: dict[tuple[str, str], dict[str, int]] = {}
+                for session in sessions:
+                    label = entrypoint_label(session.entrypoint)
+                    cwd = abbreviate_path(session.cwd)
+                    key = (label, cwd)
+                    counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
+                    counts["sessions"] += 1
+                for ide in ide_instances:
+                    name = ide_short_name(ide.ide_name)
+                    for folder in ide.workspace_folders:
+                        key = (name, abbreviate_path(folder))
+                        counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
+                        counts["ide"] += 1
+
+                print()
+                print(bolded("Running instances:"))
+                for (label, cwd), counts in groups.items():
+                    parts = []
+                    s = counts["sessions"]
+                    if s:
+                        parts.append(f"{s} session{'s' if s > 1 else ''}")
+                    if counts["ide"]:
+                        parts.append("IDE")
+                    print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
+        except Exception:
+            self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def status(self, as_json: bool = False) -> None:
-        """Display current account status or a full managed-account usage sweep."""
-        payload = self._collect_status_snapshot()
+        """Display current account status.
+
+        When as_json is True, performs a full multi-account usage sweep and
+        outputs the result as JSON.  Otherwise shows styled printer output
+        for the currently active account.
+        """
         if as_json:
+            payload = self._collect_status_snapshot()
             json.dump(payload, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return
 
-        print(self._render_status_human(payload))
+        identity = self._get_current_account()
+        if identity is None:
+            print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
+            return
+        current_email, current_org_uuid = identity
+
+        data = self._get_sequence_data_migrated()
+        if not data:
+            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+            return
+
+        account_num = None
+        org_name = ""
+        for num, info in data.get("accounts", {}).items():
+            if (info.get("email") == current_email and
+                    info.get("organizationUuid", "") == current_org_uuid):
+                account_num = num
+                org_name = info.get("organizationName", "") or ""
+                break
+
+        if account_num:
+            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
+            total = len(data.get("accounts", {}))
+            print(
+                f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
+                f"({current_email} {muted(f'[{tag}]')})"
+            )
+            print(f"  {dimmed(f'Total managed accounts: {total}')}")
+        else:
+            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
-        current_identity = self._get_current_account_identity()
-        current_email = current_identity.get("email") if current_identity else None
+        identity = self._get_current_account()
 
-        if not current_email:
-            print("No active Claude account found. Please log in first.")
+        if identity is None:
+            print(dimmed("No active Claude account found. Please log in first."))
             return
+        current_email, _ = identity
 
         response = input(
             f"No managed accounts found. Add current account "
             f"({current_email}) to managed list? [Y/n] "
         )
         if response.lower() == "n":
-            print("Setup cancelled. You can run 'cswap --add-account' later.")
+            print(dimmed("Setup cancelled. You can run 'cswap --add-account' later."))
             return
 
         self.add_account()
 
     def switch(self) -> None:
-        """Switch to next account in sequence."""
+        """Switch to next account in sequence with capacity-aware probing."""
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        current_identity = self._get_current_account_identity()
-        current_email = current_identity.get("email") if current_identity else None
-        if not current_email:
+        identity = self._get_current_account()
+        if identity is None:
             raise ConfigError("No active Claude account found")
+        current_email, current_org_uuid = identity
 
-        data = self._get_sequence_data()
-        current_account = self._find_matching_account_number(current_identity, data)
+        # Ensure org fields are migrated before checking composite key
+        self._get_sequence_data_migrated()
 
         # Check if current account is managed
-        if current_account is None:
-            self._logger.info(
-                "Current identity is not managed before switch: %s",
-                self._format_identity(current_identity),
-            )
-            print(f"Notice: Active account '{current_email}' was not managed.")
+        if not self._account_exists(current_email, current_org_uuid):
+            print(f"{accent('Notice:')} Active account '{current_email}' was not managed.")
             self.add_account()
             data = self._get_sequence_data()
             account_num = data.get("activeAccountNumber")
             print(f"It has been automatically added as Account-{account_num}.")
-            print("Please run the switch command again to switch to the next account.")
+            print(dimmed("Please run the switch command again to switch to the next account."))
             return
 
-        self._sync_active_account_number(data, current_account)
         data = self._get_sequence_data()
         sequence = data.get("sequence", [])
 
         if len(sequence) < 2:
-            print("Only one account is managed. Add more accounts to switch between.")
+            print(dimmed("Only one account is managed. Add more accounts to switch between."))
             return
 
-        # Find current index and build ordered candidate list
+        active_account = data.get("activeAccountNumber")
+
+        # Find current index and get next
         try:
-            current_index = sequence.index(int(current_account))
+            current_index = sequence.index(active_account)
         except ValueError:
             current_index = 0
-            self._logger.warning(
-                "Current Account-%s was missing from sequence ordering=%s",
-                current_account,
-                sequence,
-            )
 
+        # Build ordered candidate list for capacity-aware switching
         candidates = [
             str(sequence[(current_index + offset) % len(sequence)])
             for offset in range(1, len(sequence))
@@ -2042,7 +2332,7 @@ class ClaudeAccountSwitcher:
 
         self._logger.debug(
             "Switch rotation current_account=%s candidates=%s sequence=%s",
-            current_account,
+            active_account,
             candidates,
             sequence,
         )
@@ -2051,8 +2341,8 @@ class ClaudeAccountSwitcher:
         best_account, reason = self._find_ready_account(candidates, data)
 
         if best_account is None:
-            print("All accounts are at capacity. No switch performed.")
-            print("Run 'cswap --status' to see reset times.")
+            print(dimmed("All accounts are at capacity. No switch performed."))
+            print(dimmed("Run 'cswap --status' to see reset times."))
             return
 
         if reason:
@@ -2065,35 +2355,36 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
+        # Ensure org fields are migrated before resolving accounts
+        self._get_sequence_data_migrated()
+
         # Resolve identifier
         if not identifier.isdigit():
             if not self._validate_email(identifier):
                 raise ValidationError(f"Invalid email format: {identifier}")
 
-        data = self._get_sequence_data()
-        current_identity = self._get_current_account_identity()
-        current_email = current_identity.get("email") if current_identity else None
-        if not current_email:
-            raise ConfigError("No active Claude account found")
-
-        current_account = self._find_matching_account_number(current_identity, data)
-        if current_account is None:
-            self._logger.info(
-                "Current identity is not managed before switch-to %s: %s",
-                identifier,
-                self._format_identity(current_identity),
-            )
-            print(f"Notice: Active account '{current_email}' was not managed.")
-            self.add_account()
+            # For email identifiers, handle ambiguous matches interactively
             data = self._get_sequence_data()
-            account_num = data.get("activeAccountNumber")
-            print(f"It has been automatically added as Account-{account_num}.")
-            print(
-                "Please run the switch command again to switch to the requested account."
-            )
-            return
+            matches = [
+                num for num, acc in (data or {}).get("accounts", {}).items()
+                if acc.get("email") == identifier
+            ]
+            if len(matches) > 1:
+                print(f"Multiple accounts found for '{identifier}':")
+                for num in matches:
+                    acc = data["accounts"][num]
+                    tag = self._get_display_tag(
+                        acc.get("email", ""),
+                        acc.get("organizationName", ""),
+                        acc.get("organizationUuid", ""),
+                    )
+                    print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
+                choice = input("Enter account number to switch to: ").strip()
+                if not choice.isdigit() or choice not in matches:
+                    print(dimmed("Cancelled"))
+                    return
+                identifier = choice
 
-        self._sync_active_account_number(data, current_account)
         target_account = self._resolve_account_identifier(identifier)
         if not target_account:
             raise AccountNotFoundError(
@@ -2104,118 +2395,35 @@ class ClaudeAccountSwitcher:
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
-        self._logger.debug(
-            "Switch-to requested identifier=%s resolved_target=%s current_account=%s",
-            identifier,
-            target_account,
-            current_account,
-        )
-
-        # Probe the target account's capacity before switching
-        target_record = data.get("accounts", {}).get(target_account, {})
-        target_email = str(target_record.get("email", ""))
-        display = self._format_account_display(target_record)
-        try:
-            backup_credentials = self._read_account_credentials(
-                target_account, target_email
-            )
-            if backup_credentials:
-                backup_credentials, access_token = self._ensure_fresh_credentials(
-                    target_account, target_email, backup_credentials
-                )
-                if access_token:
-                    usage = self._fetch_usage_for_token(access_token)
-                    state = usage.get("state")
-                    windows = usage.get("windows", {})
-                    windows_line = self._render_windows_line(windows)
-
-                    if state == "auth":
-                        refreshed = self._refresh_oauth_credentials(backup_credentials)
-                        if refreshed:
-                            self._write_account_credentials(
-                                target_account, target_email, refreshed
-                            )
-                            retry_token = self._extract_access_token(refreshed)
-                            if retry_token:
-                                usage = self._fetch_usage_for_token(retry_token)
-                                state = usage.get("state")
-                                windows = usage.get("windows", {})
-                                windows_line = self._render_windows_line(windows)
-
-                    if state == "ready":
-                        status_detail = "ready"
-                        if windows_line:
-                            status_detail += f" ({windows_line})"
-                        print(f"Account-{target_account}: {display} — {status_detail}")
-                    elif state == "limited":
-                        reset_at = usage.get("rate_limited_until")
-                        reset_dt = (
-                            self._parse_status_datetime(reset_at) if reset_at else None
-                        )
-                        status_detail = "limited"
-                        if reset_dt is not None:
-                            remaining = int(
-                                (
-                                    reset_dt - datetime.now(timezone.utc)
-                                ).total_seconds()
-                            )
-                            eta = self._format_duration(max(remaining, 0))
-                            status_detail += f" (resets in {eta})"
-                        if windows_line:
-                            status_detail += f" — {windows_line}"
-                        print(
-                            f"Warning: Account-{target_account}: {display} — {status_detail}"
-                        )
-                    else:
-                        detail = usage.get("detail", state)
-                        print(f"Account-{target_account}: {display} — {detail}")
-        except Exception as exc:
-            self._logger.warning(
-                "Capacity probe failed for Account-%s: %s", target_account, exc
-            )
-
         self._perform_switch(target_account)
 
     def _perform_switch(self, target_account: str) -> None:
-        """Perform the actual account switch with transaction support."""
+        """Perform the actual account switch with transaction support.
+
+        The post-switch display runs after the lock releases so that persist
+        callbacks inside list_accounts() can re-acquire it.
+        """
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
+            current_account = str(data.get("activeAccountNumber"))
             target_email = data["accounts"][target_account]["email"]
-            target_identity = self._extract_identity(data["accounts"][target_account])
-            current_identity = self._get_current_account_identity()
-            current_email = current_identity.get("email") if current_identity else None
+            current_identity = self._get_current_account()
 
-            if not current_email:
+            if current_identity is None:
                 raise SwitchError("No current account to switch from")
+            current_email, _ = current_identity
 
-            current_account = self._find_matching_account_number(current_identity, data)
-            if current_account is None:
-                raise SwitchError(
-                    "Active Claude account is not managed. Add it with --add-account "
-                    "before switching."
-                )
-            self._sync_active_account_number(data, current_account)
-
+            # Debug: log identities for pre-switch diagnostics
+            current_identity_dict = self._get_current_account_identity()
+            target_identity_dict = self._extract_identity(data["accounts"][target_account])
             self._logger.debug(
                 "Beginning switch current_account=%s current_identity=%s "
                 "target_account=%s target_identity=%s",
                 current_account,
-                self._format_identity(current_identity),
+                self._format_identity(current_identity_dict),
                 target_account,
-                self._format_identity(target_identity),
+                self._format_identity(target_identity_dict),
             )
-
-            if current_account == target_account:
-                self._logger.info(
-                    "Requested switch target Account-%s is already active",
-                    target_account,
-                )
-                print(f"Account-{target_account} ({target_email}) is already active")
-                self.list_accounts()
-                print()
-                print("Please restart Claude Code to use the current authentication.")
-                print()
-                return
 
             config_path = self._get_claude_config_path()
 
@@ -2224,7 +2432,7 @@ class ClaudeAccountSwitcher:
                 original_creds = self._read_credentials()
                 if original_creds is None:
                     raise CredentialReadError("Failed to read current credentials")
-                original_config = config_path.read_text()
+                original_config = config_path.read_text(encoding="utf-8")
                 self._logger.debug(
                     "Captured pre-switch current credentials summary: %s",
                     self._describe_secret_payload(original_creds),
@@ -2309,11 +2517,6 @@ class ClaudeAccountSwitcher:
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
                 )
-                print(f"Switched to Account-{target_account} ({target_email})")
-                self.list_accounts()
-                print()
-                print("Please restart Claude Code to use the new authentication.")
-                print()
 
             except Exception as e:
                 self._logger.error(f"Switch failed: {e}, attempting rollback")
@@ -2332,6 +2535,18 @@ class ClaudeAccountSwitcher:
                         )
                 raise
 
+        # Lock released. Safe to do network I/O and let persist callbacks
+        # re-acquire the lock from inside list_accounts().
+        print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+        try:
+            self.list_accounts()
+        except Exception as e:
+            self._logger.warning(f"Post-switch usage display failed: {e!r}")
+            print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
+        print()
+        warning("Please restart Claude Code to use the new authentication.")
+        print()
+
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
 
@@ -2339,19 +2554,19 @@ class ClaudeAccountSwitcher:
         - All stored account credentials (files on Linux, keyring on macOS/Windows)
         - The ~/.claude-swap-backup directory and all its contents
         """
-        print("This will remove ALL claude-swap data from your system:")
+        warning("This will remove ALL claude-swap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
         if self.platform in (Platform.LINUX, Platform.WSL):
             print("  - All stored account credential files")
         else:
             print("  - All stored account credentials from the system keyring")
         print()
-        print("Note: This does NOT affect your current Claude Code login.")
+        print(dimmed("Note: This does NOT affect your current Claude Code login."))
         print()
 
         confirm = input("Are you sure you want to purge all data? [y/N] ")
         if confirm.lower() != "y":
-            print("Cancelled")
+            print(dimmed("Cancelled"))
             return
 
         removed_items = []
@@ -2394,10 +2609,10 @@ class ClaudeAccountSwitcher:
             removed_items.append(f"Directory: {self.backup_dir}")
 
         if removed_items:
-            print("\nRemoved:")
+            print(f"\n{accent('Removed:')}")
             for item in removed_items:
-                print(f"  - {item}")
+                print(f"  {dimmed('-')} {item}")
         else:
-            print("\nNo claude-swap data found to remove.")
+            print(f"\n{dimmed('No claude-swap data found to remove.')}")
 
-        print("\nPurge complete.")
+        print(f"\n{accent('Purge complete.')}")

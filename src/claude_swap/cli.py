@@ -42,6 +42,11 @@ Examples:
         help="Enable debug logging",
     )
     parser.add_argument(
+        "--token-status",
+        action="store_true",
+        help="Show OAuth token expiry state (use with --list)",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="as_json",
@@ -86,6 +91,9 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.token_status and not args.list:
+        parser.error("--token-status can only be used with --list")
     if args.as_json and not args.status:
         parser.error("--json can only be used with --status")
 
@@ -104,7 +112,9 @@ Examples:
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:
-            switcher.list_accounts()
+            switcher.list_accounts(
+                show_token_status=args.token_status,
+            )
         elif args.switch:
             switcher.switch()
         elif args.switch_to:
