@@ -519,14 +519,18 @@ class TestStatus:
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
         """Test status with managed account."""
-        # Update sequence data to match mock config email
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        switcher.status()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(switcher, "_read_account_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.status()
 
     def test_status_matches_same_email_account_by_organization_uuid(
         self, temp_home: Path, capsys: pytest.CaptureFixture[str]
@@ -1579,12 +1583,16 @@ class TestBackwardCompatibility:
             }
         }))
 
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
         switcher = ClaudeAccountSwitcher()
-        switcher.status()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(switcher, "_read_account_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.status()
 
         out = capsys.readouterr().out
         assert "account1@example.com" in out
-        assert "personal" in out
 
 
 class TestUpgradeMigration:
@@ -1612,8 +1620,13 @@ class TestUpgradeMigration:
             }
         })
 
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "test-token"}})
         switcher = ClaudeAccountSwitcher()
-        switcher.status()
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(switcher, "_read_account_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.status()
 
         out = capsys.readouterr().out
         assert "Account-1" in out

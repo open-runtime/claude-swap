@@ -14,7 +14,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
-from urllib import error, request
+from urllib import error as urllib_error, request
 
 # Only import keyring on non-Linux platforms
 if sys.platform != "linux":
@@ -626,7 +626,7 @@ class ClaudeAccountSwitcher:
                     "source": "usage_api",
                     "raw": payload,
                 }
-        except error.HTTPError as exc:
+        except urllib_error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace").strip()
             if exc.code in {401, 403}:
                 return {
@@ -661,7 +661,7 @@ class ClaudeAccountSwitcher:
                 "source": "usage_api",
                 "raw": {},
             }
-        except error.URLError as exc:
+        except urllib_error.URLError as exc:
             return {
                 "state": "probe_error",
                 "detail": str(exc.reason),
@@ -2224,48 +2224,18 @@ class ClaudeAccountSwitcher:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def status(self, as_json: bool = False) -> None:
-        """Display current account status.
+        """Display full multi-account status sweep.
 
-        When as_json is True, performs a full multi-account usage sweep and
-        outputs the result as JSON.  Otherwise shows styled printer output
-        for the currently active account.
+        Probes every managed account for usage, then restores the original
+        active account.  With as_json=True the payload is emitted as JSON;
+        otherwise a human-readable summary is printed.
         """
+        payload = self._collect_status_snapshot()
         if as_json:
-            payload = self._collect_status_snapshot()
             json.dump(payload, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
-            return
-
-        identity = self._get_current_account()
-        if identity is None:
-            print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
-            return
-        current_email, current_org_uuid = identity
-
-        data = self._get_sequence_data_migrated()
-        if not data:
-            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
-            return
-
-        account_num = None
-        org_name = ""
-        for num, info in data.get("accounts", {}).items():
-            if (info.get("email") == current_email and
-                    info.get("organizationUuid", "") == current_org_uuid):
-                account_num = num
-                org_name = info.get("organizationName", "") or ""
-                break
-
-        if account_num:
-            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
-            total = len(data.get("accounts", {}))
-            print(
-                f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email} {muted(f'[{tag}]')})"
-            )
-            print(f"  {dimmed(f'Total managed accounts: {total}')}")
         else:
-            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+            print(self._render_status_human(payload))
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
