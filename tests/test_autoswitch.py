@@ -6894,3 +6894,40 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+def _forecast_usage(session: float, fable: float) -> dict:
+    return {
+        "five_hour": {"pct": session},
+        "seven_day": {"pct": 5.0},
+        "scoped": [{"name": "Fable", "pct": fable}],
+    }
+
+
+def test_forecast_holds_flat_then_switches_at_the_ceiling(temp_home):
+    harness = EngineHarness(temp_home, strategy="forecast", model="Fable")
+    harness.seed(1, "a@example.com")
+    harness.seed(2, "b@example.com")
+    harness.make_live("a@example.com", 1)
+
+    outcome = harness.tick_with_usage({
+        "1": _forecast_usage(50, 10),
+        "2": _forecast_usage(5, 0),
+    })
+    assert outcome is TickOutcome.NO_ACTION
+    assert harness.active_number() == 1
+    assert [event.reason for event in harness.events if isinstance(event, NoSwitchEvent)] == [
+        "holding"
+    ]
+
+    harness.clock.advance(120)
+    harness.events.clear()
+    outcome = harness.tick_with_usage({
+        "1": _forecast_usage(96, 10),
+        "2": _forecast_usage(5, 0),
+    })
+    assert outcome is TickOutcome.SWITCHED
+    assert harness.active_number() == 2
+    switched = next(event for event in harness.events if isinstance(event, SwitchEvent))
+    assert switched.trigger == "forecast"
+    assert "Fable" in switched.detail
+

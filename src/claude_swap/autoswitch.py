@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import forecast, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -362,20 +362,24 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "forecast"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    detail: str = ""
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
         }
+        if self.detail:
+            fields["detail"] = self.detail
+        return fields
 
     def human(self) -> str:
         src = (
@@ -387,7 +391,10 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        line = f"{prefix} {src} -> {dst} ({self.trigger})"
+        if self.detail:
+            line = f"{line}: {self.detail}"
+        return line
 
 
 @dataclass(frozen=True)
@@ -662,6 +669,7 @@ class AutoSwitchEngine:
         switcher.set_poll_policy_inputs(settings.threshold, self._models)
         self.on_event = on_event
         self.dry_run = dry_run
+        self._forecast_detail = ""
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
@@ -893,6 +901,7 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        self._forecast_detail = ""
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -977,7 +986,11 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            if settings.strategy == "forecast":
+                # Forecast owns the leave decision, including below the fixed
+                # threshold: a fast session burn can fill inside one poll.
+                trigger = "forecast"
+            elif utilization < settings.threshold:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -1173,18 +1186,58 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
+        forecast_target: str | None = None
+        if trigger == "forecast":
+            decision = self._forecast_decision(current, usage, oauth_candidates)
+            if decision.switch_to is None:
+                if decision.reason == "all-exhausted":
+                    self._blocked_wait_long = True
+                    earliest = self._earliest_recovery(usage)
+                    if earliest is not None:
+                        self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+                    self._emit(
+                        AllExhaustedEvent(
+                            earliest_reset_at=(
+                                earliest.isoformat().replace("+00:00", "Z")
+                                if earliest
+                                else None
+                            )
+                        )
+                    )
+                    return TickOutcome.BLOCKED
+                self._emit(
+                    NoSwitchEvent(reason=decision.reason, detail=decision.detail)
+                )
+                return TickOutcome.NO_ACTION
+            if not decision.escaping_limit and self._in_cooldown(state):
+                self._emit(NoSwitchEvent(reason="cooldown", detail=decision.detail))
+                return TickOutcome.NO_ACTION
+            if decision.escaping_limit:
+                # at-limit skips the cooldown in _perform, so a full session
+                # does not sit out the rest of the cooldown window.
+                trigger = "at-limit"
+            self._forecast_detail = decision.detail
+            forecast_target = decision.switch_to
+
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-        )
+        if forecast_target is not None:
+            # Forecast already chose. The generic ranker would re-pick on the
+            # fixed threshold and could undo the burn-rate landing.
+            ordered = [forecast_target]
+            any_known = True
+            active_reset_ts = None
+        else:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
 
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -2112,6 +2165,7 @@ class AutoSwitchEngine:
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
+                    detail=self._forecast_detail,
                 )
             )
             return TickOutcome.SWITCHED
@@ -2124,7 +2178,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first", "forecast") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2167,6 +2221,7 @@ class AutoSwitchEngine:
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                detail=self._forecast_detail,
             )
         )
         return TickOutcome.SWITCHED
@@ -2178,6 +2233,61 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _remember_forecast_sample(self, number: str, usage: dict | str | None) -> list[forecast.Sample]:
+        account = forecast.snapshot(str(number), usage)
+        session = account.five_hour.pct if account is not None and account.five_hour is not None else None
+        now = self.clock()
+
+        def apply(existing: list) -> list[dict]:
+            kept = [item for item in existing if isinstance(item, dict)]
+            if session is None:
+                return kept
+            return forecast.record_sample(kept, at=now, session_pct=session)
+
+        if self.dry_run:
+            rows = apply(getattr(self, "_forecast_memory", {}).get(str(number), []))
+            memory = getattr(self, "_forecast_memory", {})
+            memory[str(number)] = rows
+            self._forecast_memory = memory
+            return forecast.samples_from(rows)
+
+        held: list = []
+
+        def mutator(state: dict) -> None:
+            raw = state.get("forecastSamples")
+            if not isinstance(raw, dict):
+                raw = {}
+            current_rows = raw.get(str(number))
+            if not isinstance(current_rows, list):
+                current_rows = []
+            raw[str(number)] = apply(current_rows)
+            state["forecastSamples"] = raw
+            held.extend(raw[str(number)])
+
+        self._mutate_state(mutator)
+        return forecast.samples_from(held)
+
+    def _forecast_decision(
+        self,
+        current: str,
+        usage: dict[str, dict | str | None],
+        oauth_candidates: list[str],
+    ) -> forecast.Decision:
+        samples = self._remember_forecast_sample(current, usage.get(current))
+        accounts: list[forecast.AccountSnapshot] = []
+        for number in (current, *oauth_candidates):
+            account = forecast.snapshot(str(number), usage.get(str(number)))
+            if account is not None and all(existing.number != account.number for existing in accounts):
+                accounts.append(account)
+        prefer_fable = any(name.lower() in ("fable", "all") for name in self._models)
+        return forecast.decide(
+            accounts,
+            current=str(current),
+            samples=samples,
+            hysteresis_pct=self.settings.hysteresis_pct,
+            prefer_fable=prefer_fable,
+        )
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]

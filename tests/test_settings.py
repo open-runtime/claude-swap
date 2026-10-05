@@ -98,6 +98,10 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
 
+    def test_forecast_is_a_valid_strategy(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "forecast")
+        assert load_settings(tmp_path).strategy == "forecast"
+
 
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):
