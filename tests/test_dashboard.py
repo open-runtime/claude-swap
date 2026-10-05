@@ -46,9 +46,10 @@ def test_token_ledger_records_fable_refusals_with_their_organization(tmp_path):
     assert len(ledger.refusals) == 1
     assert ledger.refusals[0].organization == "org-a"
     assert ledger.refusals[0].model == "claude-fable-5-1"
+    # The refusal is 83 minutes old: inside a five-hour lookback, outside one hour.
     assert ledger.refused_since("org-a", now - 5 * 3600) is not None
-    assert ledger.refused_since("org-a", now - 3600) is not None
-    assert ledger.refused_since("org-b", now - 3600) is None
+    assert ledger.refused_since("org-a", now - 3600) is None
+    assert ledger.refused_since("org-b", now - 5 * 3600) is None
 
 
 def test_token_ledger_attributes_calls_to_the_signed_in_organization(tmp_path):
