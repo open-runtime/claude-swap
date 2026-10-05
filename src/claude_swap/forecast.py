@@ -15,7 +15,10 @@ from dataclasses import dataclass
 PICKUP_S = 90.0
 QUIET_CEILING_PCT = 92.0
 LOUD_FLOOR_PCT = 70.0
-FABLE_REMAINING_FLOOR = 5.0
+# An account above this Fable utilization is not a place to send Fable work.
+# Five percent left still returns "You've reached your Fable limit" within a
+# minute of real traffic, which is what happened on slot 6.
+FABLE_USABLE_MAX_PCT = 80.0
 MIN_SAMPLE_SPAN_S = 45.0
 MAX_SAMPLES = 8
 
@@ -37,6 +40,7 @@ class AccountSnapshot:
 class Sample:
     at: float
     session_pct: float
+    fable_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -91,8 +95,14 @@ def snapshot(number: str, usage: dict | str | None) -> AccountSnapshot | None:
     return account
 
 
-def record_sample(existing: list, *, at: float, session_pct: float) -> list[dict]:
-    """Append one session reading, dropping duplicates and keeping the tail."""
+def record_sample(
+    existing: list,
+    *,
+    at: float,
+    session_pct: float,
+    fable_pct: float | None = None,
+) -> list[dict]:
+    """Append one reading, dropping duplicates and keeping the tail."""
     row: list[dict] = []
     for item in existing:
         if (
@@ -100,42 +110,105 @@ def record_sample(existing: list, *, at: float, session_pct: float) -> list[dict
             and isinstance(item.get("at"), (int, float))
             and isinstance(item.get("pct"), (int, float))
         ):
-            row.append({"at": float(item["at"]), "pct": float(item["pct"])})
+            kept = {"at": float(item["at"]), "pct": float(item["pct"])}
+            if isinstance(item.get("fable"), (int, float)):
+                kept["fable"] = float(item["fable"])
+            row.append(kept)
     if row and at <= row[-1]["at"]:
         return row[-MAX_SAMPLES:]
+    last_fable = row[-1].get("fable") if row else None
+    fable_unchanged = (
+        fable_pct is None
+        or not isinstance(last_fable, float)
+        or abs(last_fable - fable_pct) < 0.05
+    )
     if (
         row
         and abs(row[-1]["pct"] - session_pct) < 0.05
+        and fable_unchanged
         and at - row[-1]["at"] < MIN_SAMPLE_SPAN_S
     ):
         return row[-MAX_SAMPLES:]
-    row.append({"at": at, "pct": session_pct})
+    stored = {"at": at, "pct": session_pct}
+    if fable_pct is not None:
+        stored["fable"] = fable_pct
+    row.append(stored)
     return row[-MAX_SAMPLES:]
 
 
 def samples_from(raw: list) -> list[Sample]:
-    return [
-        Sample(at=float(item["at"]), session_pct=float(item["pct"]))
-        for item in raw
-        if isinstance(item, dict)
-        and isinstance(item.get("at"), (int, float))
-        and isinstance(item.get("pct"), (int, float))
-    ]
+    samples: list[Sample] = []
+    for item in raw:
+        if not (
+            isinstance(item, dict)
+            and isinstance(item.get("at"), (int, float))
+            and isinstance(item.get("pct"), (int, float))
+        ):
+            continue
+        fable = item.get("fable")
+        samples.append(
+            Sample(
+                at=float(item["at"]),
+                session_pct=float(item["pct"]),
+                fable_pct=float(fable) if isinstance(fable, (int, float)) else None,
+            )
+        )
+    return samples
 
 
 def session_burn(samples: list[Sample]) -> float | None:
-    """Session-percent per second, or None until two readings span the minimum."""
+    """Session-percent per second of the latest rise.
+
+    The slope from the oldest retained reading to the newest is one line
+    across the whole ring (about seven minutes). A slow start hides a spike
+    at the end, and a repeated reading stretches that line so the runway
+    looks longer. The latest step whose session percent rose is the burn.
+    A flat or lower newest reading keeps that rise instead of clearing it.
+    """
     if len(samples) < 2:
         return None
-    first, last = samples[0], samples[-1]
-    span = last.at - first.at
-    if span < MIN_SAMPLE_SPAN_S:
-        return None
-    return max(0.0, (last.session_pct - first.session_pct) / span)
+    saw_span = False
+    for index in range(len(samples) - 1, 0, -1):
+        current = samples[index]
+        previous = samples[index - 1]
+        span = current.at - previous.at
+        if span < MIN_SAMPLE_SPAN_S:
+            continue
+        saw_span = True
+        delta = current.session_pct - previous.session_pct
+        if delta > 0.0:
+            return delta / span
+    return 0.0 if saw_span else None
+
+
+def fable_burn(samples: list[Sample]) -> float | None:
+    """Fable-percent per second of the latest rise. Same rule as the session."""
+    usable = [
+        Sample(at=sample.at, session_pct=sample.fable_pct)
+        for sample in samples
+        if sample.fable_pct is not None
+    ]
+    return session_burn(usable)
+
+
+def with_latest_session(samples: list[Sample], session_pct: float | None) -> list[Sample]:
+    """Replace the newest sample's percent when a fresher reading arrived.
+
+    The timestamp stays. A refetch is a correction of the reading just taken,
+    not a new interval, so it must not invent a burn over a fraction of a second.
+    """
+    if session_pct is None or not samples:
+        return samples
+    last = samples[-1]
+    if abs(last.session_pct - session_pct) < 0.05:
+        return samples
+    corrected = list(samples)
+    corrected[-1] = Sample(at=last.at, session_pct=session_pct)
+    return corrected
 
 
 def _fable_usable(account: AccountSnapshot) -> bool:
-    if account.fable is None or account.fable.pct > 100.0 - FABLE_REMAINING_FLOOR:
+    if account.fable is None or account.fable.pct > FABLE_USABLE_MAX_PCT:
         return False
     if account.five_hour is not None and account.five_hour.pct >= 100.0:
         return False
@@ -165,39 +238,58 @@ def _headroom(account: AccountSnapshot, *, fable: bool) -> float:
     return 100.0 - max(pcts)
 
 
-def _should_leave(active: AccountSnapshot, samples: list[Sample]) -> tuple[bool, bool, str]:
-    """Whether to leave, whether this is a hard limit, and why."""
+def _should_leave(
+    active: AccountSnapshot, samples: list[Sample], *, prefer_fable: bool
+) -> tuple[bool, bool, str]:
+    """Whether to leave, whether this is a hard session/weekly limit, and why.
+
+    The reason starts with ``fable`` when Fable is the only window forcing the
+    move. A full Fable week used to be ignored while the session still had
+    hours left, which is how slot 6 sat at Fable 100% and session 17%.
+    """
     session = active.five_hour.pct if active.five_hour is not None else None
     weekly = active.seven_day.pct if active.seven_day is not None else None
+    fable = active.fable.pct if prefer_fable and active.fable is not None else None
     if (session is not None and session >= 100.0) or (weekly is not None and weekly >= 100.0):
-        return True, True, "at-limit"
+        return True, True, "session-limit"
     if (
         (session is not None and session >= QUIET_CEILING_PCT)
         or (weekly is not None and weekly >= QUIET_CEILING_PCT)
     ):
-        return True, False, "ceiling"
-    if session is None:
-        return False, False, "holding"
-    burn = session_burn(samples)
-    if burn is None or burn <= 0.0 or session < LOUD_FLOOR_PCT:
-        return False, False, "holding"
-    remaining = 100.0 - session
-    if remaining / burn < PICKUP_S:
-        return True, False, "burn"
+        return True, False, "session-ceiling"
+    if session is not None and session >= LOUD_FLOOR_PCT:
+        burn = session_burn(samples)
+        if burn is not None and burn > 0.0 and (100.0 - session) / burn < PICKUP_S:
+            return True, False, "session-burn"
+    if fable is not None and fable >= 100.0:
+        return True, True, "fable-limit"
+    if fable is not None and fable > FABLE_USABLE_MAX_PCT:
+        return True, False, "fable-ceiling"
+    if fable is not None and fable >= LOUD_FLOOR_PCT:
+        burn = fable_burn(samples)
+        if burn is not None and burn > 0.0 and (100.0 - fable) / burn < PICKUP_S:
+            return True, False, "fable-burn"
     return False, False, "holding"
 
 
-def _fill_phrase(active: AccountSnapshot, samples: list[Sample]) -> str:
-    session = active.five_hour
-    if session is None:
-        return "session unread"
-    burn = session_burn(samples)
+def _runway_phrase(label: str, pct: float, burn: float | None) -> str:
     if burn is None or burn <= 0.0:
-        return f"session {session.pct:.0f}%"
-    seconds = (100.0 - session.pct) / burn
+        return f"{label} {pct:.0f}%"
+    seconds = (100.0 - pct) / burn
     if seconds >= 3600.0:
-        return f"session {session.pct:.0f}%, about {seconds / 3600.0:.1f}h of runway"
-    return f"session {session.pct:.0f}%, about {max(1, round(seconds / 60.0)):.0f}m of runway"
+        return f"{label} {pct:.0f}%, about {seconds / 3600.0:.1f}h of runway"
+    return f"{label} {pct:.0f}%, about {max(1, round(seconds / 60.0)):.0f}m of runway"
+
+
+def _fill_phrase(active: AccountSnapshot, samples: list[Sample]) -> str:
+    parts: list[str] = []
+    if active.five_hour is None:
+        parts.append("session unread")
+    else:
+        parts.append(_runway_phrase("session", active.five_hour.pct, session_burn(samples)))
+    if active.fable is not None:
+        parts.append(_runway_phrase("Fable", active.fable.pct, fable_burn(samples)))
+    return "; ".join(parts)
 
 
 def _hold_detail(
@@ -227,9 +319,10 @@ def decide(
 ) -> Decision:
     """Pick a landing account, or stay.
 
-    Fable changes who we land on. It does not by itself force a leave while
-    the session and the shared weekly window still have runway, because that
-    would abandon an account Opus can still use.
+    When Fable is the model being protected, a Fable week past
+    ``FABLE_USABLE_MAX_PCT`` forces a leave even if the session is quiet.
+    If no other account has real Fable room and an open session, stay and
+    say so, instead of moving to another account that is also out of Fable.
     """
     active = next((account for account in accounts if account.number == current), None)
     if active is None:
@@ -241,7 +334,20 @@ def decide(
             escaping_limit=False,
         )
     fable_available = prefer_fable and any(_fable_usable(account) for account in accounts)
-    leave, escaping, _because = _should_leave(active, samples)
+    leave, escaping, because = _should_leave(active, samples, prefer_fable=prefer_fable)
+    fable_only = because.startswith("fable")
+    if fable_only and not any(_fable_usable(account) for account in accounts if account.number != current):
+        phrase = _fill_phrase(active, samples)
+        return Decision(
+            switch_to=None,
+            reason="fable-unavailable",
+            detail=(
+                "Fable is full, and no account with Fable room has an open session. "
+                f"{phrase}"
+            ),
+            fable_available=False,
+            escaping_limit=False,
+        )
     if not leave:
         return Decision(
             switch_to=None,
@@ -298,7 +404,9 @@ def decide(
         )
         and peer_headroom(account) > 0.0
     ]
-    if not qualified and escaping:
+    if not qualified and escaping and landing_fable:
+        qualified = [account for account in peers if peer_headroom(account) > 0.0]
+    elif not qualified and escaping and not fable_only:
         qualified = [account for account in peers if peer_headroom(account) > 0.0]
     if not qualified:
         phrase = _fill_phrase(active, samples)

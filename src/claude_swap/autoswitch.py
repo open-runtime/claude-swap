@@ -1189,6 +1189,12 @@ class AutoSwitchEngine:
         forecast_target: str | None = None
         if trigger == "forecast":
             decision = self._forecast_decision(current, usage, oauth_candidates)
+            if decision.switch_to is not None:
+                decision, usage, entries = self._confirm_forecast_landing(
+                    current, usage, entries, oauth_candidates, decision
+                )
+                headroom = _headroom_by_account(usage, self._models)
+                active_headroom = headroom.get(current)
             if decision.switch_to is None:
                 if decision.reason == "all-exhausted":
                     self._blocked_wait_long = True
@@ -2243,7 +2249,8 @@ class AutoSwitchEngine:
             kept = [item for item in existing if isinstance(item, dict)]
             if session is None:
                 return kept
-            return forecast.record_sample(kept, at=now, session_pct=session)
+            fable = account.fable.pct if account is not None and account.fable is not None else None
+            return forecast.record_sample(kept, at=now, session_pct=session, fable_pct=fable)
 
         if self.dry_run:
             rows = apply(getattr(self, "_forecast_memory", {}).get(str(number), []))
@@ -2268,15 +2275,36 @@ class AutoSwitchEngine:
         self._mutate_state(mutator)
         return forecast.samples_from(held)
 
+    def _load_forecast_samples(self, number: str) -> list[forecast.Sample]:
+        if self.dry_run:
+            raw = getattr(self, "_forecast_memory", {}).get(str(number), [])
+        else:
+            stored = self._read_state().get("forecastSamples")
+            raw = stored.get(str(number), []) if isinstance(stored, dict) else []
+        if not isinstance(raw, list):
+            raw = []
+        return forecast.samples_from(raw)
+
     def _forecast_decision(
         self,
         current: str,
         usage: dict[str, dict | str | None],
         oauth_candidates: list[str],
+        *,
+        record: bool = True,
+        exclude: frozenset[str] = frozenset(),
     ) -> forecast.Decision:
-        samples = self._remember_forecast_sample(current, usage.get(current))
+        if record:
+            samples = self._remember_forecast_sample(current, usage.get(current))
+        else:
+            samples = self._load_forecast_samples(current)
+            active = forecast.snapshot(str(current), usage.get(str(current)))
+            session = active.five_hour.pct if active is not None and active.five_hour is not None else None
+            samples = forecast.with_latest_session(samples, session)
         accounts: list[forecast.AccountSnapshot] = []
         for number in (current, *oauth_candidates):
+            if str(number) in exclude:
+                continue
             account = forecast.snapshot(str(number), usage.get(str(number)))
             if account is not None and all(existing.number != account.number for existing in accounts):
                 accounts.append(account)
@@ -2288,6 +2316,56 @@ class AutoSwitchEngine:
             hysteresis_pct=self.settings.hysteresis_pct,
             prefer_fable=prefer_fable,
         )
+
+    def _confirm_forecast_landing(
+        self,
+        current: str,
+        usage: dict[str, dict | str | None],
+        entries: dict,
+        oauth_candidates: list[str],
+        decision: forecast.Decision,
+    ) -> tuple[forecast.Decision, dict, dict]:
+        """Read the chosen account once more before leaving the current one.
+
+        Candidate readings can sit for minutes while the active account is
+        the one being polled. One fetch of the landing account is enough to
+        reject a stale low number; a second fetch covers the replacement.
+        """
+        excluded: set[str] = set()
+        for _attempt in range(2):
+            target = decision.switch_to
+            if target is None or target in excluded:
+                break
+            before = entries.get(target)
+            before_at = before.fetched_at if before is not None else None
+            refreshed = self.switcher.usage_entries_by_account(fetch={target})
+            entries = refreshed
+            usage = {
+                num: entry.decision_value() for num, entry in refreshed.items()
+            }
+            after = refreshed.get(target)
+            after_at = after.fetched_at if after is not None else None
+            confirmed = after_at is not None and (before_at is None or after_at > before_at)
+            decision = self._forecast_decision(
+                current,
+                usage,
+                oauth_candidates,
+                record=False,
+                exclude=frozenset(excluded),
+            )
+            if confirmed and decision.switch_to == target:
+                break
+            if decision.switch_to != target and decision.switch_to is not None:
+                continue
+            excluded.add(target)
+            decision = self._forecast_decision(
+                current,
+                usage,
+                oauth_candidates,
+                record=False,
+                exclude=frozenset(excluded),
+            )
+        return decision, usage, entries
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]

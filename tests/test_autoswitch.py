@@ -6903,6 +6903,13 @@ def _forecast_usage(session: float, fable: float) -> dict:
     }
 
 
+def _forecast_entries(usage: dict, stamp: float) -> dict[str, UsageEntry]:
+    return {
+        num: UsageEntry(last_good=value, fetched_at=stamp, age_s=0.0)
+        for num, value in usage.items()
+    }
+
+
 def test_forecast_holds_flat_then_switches_at_the_ceiling(temp_home):
     harness = EngineHarness(temp_home, strategy="forecast", model="Fable")
     harness.seed(1, "a@example.com")
@@ -6921,13 +6928,54 @@ def test_forecast_holds_flat_then_switches_at_the_ceiling(temp_home):
 
     harness.clock.advance(120)
     harness.events.clear()
-    outcome = harness.tick_with_usage({
-        "1": _forecast_usage(96, 10),
-        "2": _forecast_usage(5, 0),
-    })
+    usage = {"1": _forecast_usage(96, 10), "2": _forecast_usage(5, 0)}
+
+    def entries(fetch=None, scheduled=False):
+        # A landing fetch rewrites the chosen account's timestamp. The same
+        # object coming back with the old timestamp is a skipped read.
+        stamp = harness.clock.now + (1 if fetch and len(fetch) == 1 else 0)
+        return _forecast_entries(usage, stamp)
+
+    with patch.object(harness.switcher, "usage_entries_by_account", side_effect=entries):
+        outcome = harness.engine.tick()
     assert outcome is TickOutcome.SWITCHED
     assert harness.active_number() == 2
     switched = next(event for event in harness.events if isinstance(event, SwitchEvent))
     assert switched.trigger == "forecast"
     assert "Fable" in switched.detail
+
+
+def test_forecast_rejects_a_stale_landing_reading(temp_home):
+    harness = EngineHarness(temp_home, strategy="forecast", model="Fable")
+    harness.seed(1, "a@example.com")
+    harness.seed(2, "b@example.com")
+    harness.seed(3, "c@example.com")
+    harness.make_live("a@example.com", 1)
+    stored = {
+        "1": _forecast_usage(96, 10),
+        "2": _forecast_usage(5, 0),
+        "3": _forecast_usage(40, 0),
+    }
+    truth = {"2": 91.0, "3": 12.0}
+
+    def entries(fetch=None, scheduled=False):
+        if fetch and len(fetch) == 1:
+            number = next(iter(fetch))
+            if number in truth:
+                stored[number] = _forecast_usage(truth[number], 0)
+        stamp_for = {}
+        for number in stored:
+            stamp_for[number] = harness.clock.now
+        if fetch and len(fetch) == 1:
+            number = next(iter(fetch))
+            stamp_for[number] = harness.clock.now + 5
+        return {
+            number: UsageEntry(last_good=value, fetched_at=stamp_for[number], age_s=0.0)
+            for number, value in stored.items()
+        }
+
+    with patch.object(harness.switcher, "usage_entries_by_account", side_effect=entries):
+        outcome = harness.engine.tick()
+    assert outcome is TickOutcome.SWITCHED
+    assert harness.active_number() == 3
 
