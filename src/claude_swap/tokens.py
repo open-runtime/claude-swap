@@ -67,11 +67,15 @@ class Call:
 
 @dataclass(frozen=True)
 class Refusal:
-    """The API refused a model on this organization and Claude Code fell back.
+    """The API refused a model on this organization.
 
-    Recorded from ``model_consent_fallback`` system rows. The usage endpoint
-    can show a Fable window with room while the API still answers
-    ``model_requires_usage_credit``; this is the only local record of that.
+    Recorded from ``assistant`` rows whose ``apiError`` names a usage-credit
+    refusal: an answer the server actually gave. Claude Code also writes
+    ``model_consent_fallback`` system rows when it declines a model from the
+    profile it holds in memory, without calling the API; on Oct 5 two
+    long-running sessions did that for an hour on accounts whose Fable was
+    fine, because they had loaded a standard seat's profile during a login.
+    Those rows say nothing about the account and are not counted.
     """
 
     at: float
@@ -159,22 +163,6 @@ class TokenLedger:
                 if isinstance(organization, str):
                     cursor.organization = organization
                 continue
-            if '"model_consent_fallback"' in line:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                stamp = _parse_timestamp(row.get("timestamp"))
-                if stamp is not None and row.get("type") == "system":
-                    self.refusals.append(
-                        Refusal(
-                            at=stamp,
-                            organization=cursor.organization,
-                            model=str(row.get("originalModel") or ""),
-                            fallback_model=str(row.get("fallbackModel") or ""),
-                        )
-                    )
-                continue
             if '"usage"' not in line or '"assistant"' not in line:
                 continue
             try:
@@ -184,6 +172,19 @@ class TokenLedger:
             if row.get("type") != "assistant":
                 continue
             message = row.get("message") or {}
+            api_error = row.get("apiError")
+            if isinstance(api_error, str) and "usage_credit" in api_error:
+                stamp = _parse_timestamp(row.get("timestamp"))
+                if stamp is not None:
+                    self.refusals.append(
+                        Refusal(
+                            at=stamp,
+                            organization=cursor.organization,
+                            model=str(message.get("model") or ""),
+                            fallback_model="",
+                        )
+                    )
+                continue
             usage = message.get("usage") or {}
             if not isinstance(usage, dict):
                 continue
