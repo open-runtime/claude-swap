@@ -976,6 +976,26 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _dashboard_command(argv: list[str]) -> None:
+    """Serve the usage page on the loopback interface."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} dashboard",
+        description="Show account usage and the forecast decision in a browser.",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8765,
+        help="Loopback port (default 8765)",
+    )
+    args = parser.parse_args(argv)
+    if args.port < 1 or args.port > 65535:
+        parser.error("--port must be between 1 and 65535")
+    from claude_swap.dashboard import serve
+
+    switcher = ClaudeAccountSwitcher()
+    _guard_root(switcher)
+    serve(switcher, port=args.port)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -999,6 +1019,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "dashboard":
+        _dashboard_command(argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1059,6 +1082,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s dashboard                 localhost page of usage and the forecast
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

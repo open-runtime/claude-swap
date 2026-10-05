@@ -10,6 +10,7 @@ which covers the macOS keychain pickup plus one more sample.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 PICKUP_S = 90.0
@@ -21,6 +22,12 @@ LOUD_FLOOR_PCT = 70.0
 FABLE_USABLE_MAX_PCT = 80.0
 MIN_SAMPLE_SPAN_S = 45.0
 MAX_SAMPLES = 8
+# A landing must be worth at least this long at the machine's current token
+# demand, when that can be measured. One percent of a team seat's week under
+# a dozen agents is gone before the switch has finished landing.
+MIN_LANDING_MINUTES = 10.0
+
+MinutesFor = Callable[[str, str], float | None]
 
 
 @dataclass(frozen=True)
@@ -208,11 +215,17 @@ def with_latest_session(samples: list[Sample], session_pct: float | None) -> lis
 
 
 def _fable_usable(account: AccountSnapshot) -> bool:
+    """A place Fable work can actually run for a while.
+
+    The shared session and weekly windows must be under the leave line, not
+    just under 100%. Slot 5 at weekly 99% counted as Fable room once, the
+    engine landed there, and the next tick left again.
+    """
     if account.fable is None or account.fable.pct > FABLE_USABLE_MAX_PCT:
         return False
-    if account.five_hour is not None and account.five_hour.pct >= 100.0:
+    if account.five_hour is not None and account.five_hour.pct >= QUIET_CEILING_PCT:
         return False
-    if account.seven_day is not None and account.seven_day.pct >= 100.0:
+    if account.seven_day is not None and account.seven_day.pct >= QUIET_CEILING_PCT:
         return False
     return True
 
@@ -309,6 +322,13 @@ def _hold_detail(
     return f"{phrase}; {hold}"
 
 
+def _worth_landing(account: AccountSnapshot, model: str, minutes_for: MinutesFor | None) -> bool:
+    if minutes_for is None:
+        return True
+    minutes = minutes_for(account.number, model)
+    return minutes is None or minutes >= MIN_LANDING_MINUTES
+
+
 def decide(
     accounts: list[AccountSnapshot],
     *,
@@ -316,6 +336,7 @@ def decide(
     samples: list[Sample],
     hysteresis_pct: float,
     prefer_fable: bool,
+    minutes_for: MinutesFor | None = None,
 ) -> Decision:
     """Pick a landing account, or stay.
 
@@ -333,10 +354,16 @@ def decide(
             fable_available=False,
             escaping_limit=False,
         )
-    fable_available = prefer_fable and any(_fable_usable(account) for account in accounts)
+    def fable_peer(account: AccountSnapshot) -> bool:
+        return _fable_usable(account) and _worth_landing(account, "fable", minutes_for)
+
+    def opus_peer(account: AccountSnapshot) -> bool:
+        return _opus_usable(account) and _worth_landing(account, "opus", minutes_for)
+
+    fable_available = prefer_fable and any(fable_peer(account) for account in accounts)
     leave, escaping, because = _should_leave(active, samples, prefer_fable=prefer_fable)
     fable_only = because.startswith("fable")
-    if fable_only and not any(_fable_usable(account) for account in accounts if account.number != current):
+    if fable_only and not any(fable_peer(account) for account in accounts if account.number != current):
         phrase = _fill_phrase(active, samples)
         return Decision(
             switch_to=None,
@@ -365,11 +392,14 @@ def decide(
     others = [account for account in accounts if account.number != current]
     landing_fable = False
     if fable_available:
-        peers = [account for account in others if _fable_usable(account)]
+        peers = [account for account in others if fable_peer(account)]
         landing_fable = bool(peers)
         if not peers:
-            peers = [account for account in others if _opus_usable(account)]
+            peers = [account for account in others if opus_peer(account)]
     else:
+        peers = [account for account in others if opus_peer(account)]
+    if not peers and escaping and not fable_only:
+        # Leaving a dead account: a short landing still beats no landing.
         peers = [account for account in others if _opus_usable(account)]
     if not peers:
         if not _opus_usable(active) and all(not _opus_usable(account) for account in others):
@@ -417,18 +447,33 @@ def decide(
             fable_available=fable_available,
             escaping_limit=escaping,
         )
-    qualified.sort(key=lambda account: (-peer_headroom(account), int(account.number) if account.number.isdigit() else account.number))
+    model = "fable" if landing_fable else "opus"
+
+    def rank(account: AccountSnapshot) -> tuple:
+        # Minutes at the current pace first, when measured; a 20x plan at 30%
+        # lasts longer than a team seat at 10% left. Headroom breaks ties.
+        minutes = minutes_for(account.number, model) if minutes_for else None
+        return (
+            0 if minutes is not None else 1,
+            -(minutes or 0.0),
+            -peer_headroom(account),
+            int(account.number) if account.number.isdigit() else 0,
+        )
+
+    qualified.sort(key=rank)
     chosen = qualified[0]
     phrase = _fill_phrase(active, samples)
+    minutes = minutes_for(chosen.number, model) if minutes_for else None
+    lasting = f", about {minutes:.0f} minutes at the current pace" if minutes is not None else ""
     if landing_fable:
-        detail = f"{phrase}; switching to account {chosen.number}, which has the most Fable room"
+        detail = f"{phrase}; switching to account {chosen.number}, which has the most Fable room{lasting}"
     elif prefer_fable:
         detail = (
             "Fable is unavailable on every other account; only session and weekly remain. "
-            f"{phrase}; switching to account {chosen.number}"
+            f"{phrase}; switching to account {chosen.number}{lasting}"
         )
     else:
-        detail = f"{phrase}; switching to account {chosen.number}"
+        detail = f"{phrase}; switching to account {chosen.number}{lasting}"
     return Decision(
         switch_to=chosen.number,
         reason="forecast",

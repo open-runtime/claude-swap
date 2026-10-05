@@ -6945,6 +6945,33 @@ def test_forecast_holds_flat_then_switches_at_the_ceiling(temp_home):
     assert "Fable" in switched.detail
 
 
+def test_forecast_accepts_a_landing_reading_the_store_will_not_refetch(temp_home):
+    """Slot 5 on Oct 5: its reading was 60s old, the store served it instead
+    of fetching, and the engine dropped it as unconfirmed, then reported
+    Fable unavailable with a usable account sitting right there."""
+    harness = EngineHarness(temp_home, strategy="forecast", model="Fable")
+    harness.seed(1, "a@example.com")
+    harness.seed(2, "b@example.com")
+    harness.make_live("a@example.com", 1)
+    usage = {
+        "1": {"five_hour": {"pct": 20}, "seven_day": {"pct": 58}, "scoped": [{"name": "Fable", "pct": 100}]},
+        "2": {"five_hour": {"pct": 31}, "seven_day": {"pct": 40}, "scoped": [{"name": "Fable", "pct": 76}]},
+    }
+    fetched_at = harness.clock.now - 60
+
+    def entries(fetch=None, scheduled=False):
+        # Same timestamp every time: the store never refetches a fresh row.
+        return {
+            number: UsageEntry(last_good=value, fetched_at=fetched_at, age_s=60.0)
+            for number, value in usage.items()
+        }
+
+    with patch.object(harness.switcher, "usage_entries_by_account", side_effect=entries):
+        outcome = harness.engine.tick()
+    assert outcome is TickOutcome.SWITCHED
+    assert harness.active_number() == 2
+
+
 def test_forecast_rejects_a_stale_landing_reading(temp_home):
     harness = EngineHarness(temp_home, strategy="forecast", model="Fable")
     harness.seed(1, "a@example.com")

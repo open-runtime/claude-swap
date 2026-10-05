@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import forecast, oauth, poll_policy
+from claude_swap import allocation, forecast, oauth, poll_policy, tokens
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -670,6 +670,9 @@ class AutoSwitchEngine:
         self.on_event = on_event
         self.dry_run = dry_run
         self._forecast_detail = ""
+        # Token ledger for the forecast strategy's minutes-of-room estimate.
+        # Built on first use; the first scan reads every recent session log.
+        self._ledger: tokens.TokenLedger | None = None
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
@@ -2315,7 +2318,55 @@ class AutoSwitchEngine:
             samples=samples,
             hysteresis_pct=self.settings.hysteresis_pct,
             prefer_fable=prefer_fable,
+            minutes_for=self._minutes_for(accounts),
         )
+
+    def _minutes_for(self, accounts: list[forecast.AccountSnapshot]) -> forecast.MinutesFor | None:
+        """Minutes of room per account at this machine's current token demand.
+
+        None when the ledger or history cannot be read; the forecast then
+        falls back to percent headroom alone.
+        """
+        try:
+            if self._ledger is None:
+                self._ledger = tokens.TokenLedger(tokens.default_root())
+            now = self.clock()
+            if now - self._ledger.last_scan_at >= 60.0:
+                self._ledger.refresh(now)
+            store = self.switcher._usage_store
+            history = allocation.readings_from_history(store.history(now - 24 * 3600.0))
+            if not history:
+                return None
+            sequence = (self.switcher._get_sequence_data() or {}).get("accounts", {})
+            organizations = {
+                str(number): (info.get("organizationUuid") or "")
+                for number, info in sequence.items()
+            }
+            measure = allocation.Allocation(
+                history,
+                self._ledger.calls,
+                slot_organizations=organizations,
+                tiers={},
+                now=now,
+            )
+            latest = {
+                account.number: {
+                    "h5": {"pct": account.five_hour.pct} if account.five_hour else None,
+                    "d7": {"pct": account.seven_day.pct} if account.seven_day else None,
+                    "fable": {"pct": account.fable.pct} if account.fable else None,
+                }
+                for account in accounts
+            }
+            rooms = measure.summarize(latest, 24 * 3600.0)
+        except Exception as error:  # the estimate is advisory; never block a tick
+            _logger.debug("minutes-of-room estimate unavailable: %s", error)
+            return None
+
+        def minutes_for(number: str, model: str) -> float | None:
+            room = rooms.get(str(number))
+            return room.minutes_for(model) if room is not None else None
+
+        return minutes_for
 
     def _confirm_forecast_landing(
         self,
@@ -2345,7 +2396,13 @@ class AutoSwitchEngine:
             }
             after = refreshed.get(target)
             after_at = after.fetched_at if after is not None else None
-            confirmed = after_at is not None and (before_at is None or after_at > before_at)
+            # The store serves a reading younger than the serve TTL instead
+            # of fetching again. That reading is as fresh as a fetch would
+            # be, so it confirms the landing. Only a reading older than the
+            # TTL that could not be refreshed is unconfirmed.
+            refetched = after_at is not None and (before_at is None or after_at > before_at)
+            fresh_enough = after_at is not None and (self.clock() - after_at) <= poll_policy.SERVE_TTL_S
+            confirmed = refetched or fresh_enough
             decision = self._forecast_decision(
                 current,
                 usage,

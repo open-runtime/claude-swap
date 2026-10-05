@@ -35,6 +35,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -833,6 +834,30 @@ def _failure_backoff_s(
     return max(asked, computed)
 
 
+def _history_line(now: float, num: str, identity: Identity, usage: dict | None) -> str:
+    """One compact reading for ``usage_history.jsonl``: slot, identity, percents."""
+    row: dict = {"at": round(now, 1), "slot": num, "email": identity[0], "org": identity[1]}
+    if isinstance(usage, dict):
+        for key, label in (("five_hour", "h5"), ("seven_day", "d7")):
+            window = usage.get(key)
+            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+                row[label] = float(window["pct"])
+                if window.get("resets_at"):
+                    row[label + "Reset"] = window["resets_at"]
+        scoped = usage.get("scoped")
+        if isinstance(scoped, list):
+            for item in scoped:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("name"), str)
+                    and isinstance(item.get("pct"), (int, float))
+                ):
+                    row.setdefault("scoped", {})[item["name"]] = float(item["pct"])
+                    if item.get("resets_at"):
+                        row.setdefault("scopedReset", {})[item["name"]] = item["resets_at"]
+    return json.dumps(row, separators=(",", ":"))
+
+
 class UsageStore:
     """The ``cache/usage.json`` table. All writes go read-modify-write under
     ``cache/.usage.lock``; reads are lock-free (writes are atomic replaces).
@@ -1089,6 +1114,7 @@ class UsageStore:
             return set()
         now = self.clock()
         accepted: set[str] = set()
+        history: list[str] = []
 
         def apply(num: str, row: dict) -> None:
             accepted.add(num)
@@ -1103,6 +1129,7 @@ class UsageStore:
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
+                history.append(_history_line(now, num, identities[num], rec.usage))
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
                 plan = plans.get(num) if plans is not None else None
@@ -1166,7 +1193,58 @@ class UsageStore:
                 apply(num, row)
             if accepted:
                 self._write_rows(rows)
+            if history:
+                self._append_history(history)
         return accepted
+
+    # -- history ---------------------------------------------------------------
+    #
+    # ``cache/usage_history.jsonl`` keeps every successful reading, one line
+    # each, so burn rates and tokens-per-percent can be measured per account
+    # over a lookback. ``lastGood`` alone only ever holds the latest reading.
+
+    @property
+    def history_path(self) -> Path:
+        return self.path.parent / "usage_history.jsonl"
+
+    def _append_history(self, lines: list[str]) -> None:
+        try:
+            with self.history_path.open("a", encoding="utf-8") as handle:
+                handle.write("".join(line + "\n" for line in lines))
+        except OSError:
+            pass
+
+    def history(self, since: float) -> list[dict]:
+        """Readings at or after ``since``, oldest first. Missing file = []."""
+        out: list[dict] = []
+        try:
+            with self.history_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and isinstance(row.get("at"), (int, float)) and row["at"] >= since:
+                        out.append(row)
+        except OSError:
+            return []
+        return out
+
+    def prune_history(self, keep_s: float) -> None:
+        """Drop readings older than ``keep_s`` by rewriting the file once."""
+        cutoff = self.clock() - keep_s
+        kept = self.history(cutoff)
+        text = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in kept)
+        with self._lock():
+            tmp = self.history_path.with_suffix(".jsonl.tmp")
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                replace_with_retry(str(tmp), str(self.history_path))
+            except OSError:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def adopt(
         self,

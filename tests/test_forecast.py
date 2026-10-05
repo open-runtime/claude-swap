@@ -128,6 +128,49 @@ class TestForecastPolicy:
         assert decision.switch_to == "8"
         assert "most Fable room" in decision.detail
 
+    def test_fable_landing_needs_shared_windows_under_the_leave_line(self):
+        # Slot 5: Fable 76% but weekly 99%. Landing there means leaving next tick.
+        decision = _decide(
+            [
+                _account("6", 20, weekly=58, fable=100),
+                _account("5", 31, weekly=99, fable=76),
+            ],
+            [Sample(0, 20), Sample(120, 20)],
+            current="6",
+        )
+        assert decision.switch_to is None
+        assert decision.reason == "fable-unavailable"
+
+    def test_one_percent_is_not_a_landing_when_it_lasts_under_ten_minutes(self):
+        # Slot 4 has 20% headroom but a measured 3 minutes at the current
+        # pace; slot 6 has less headroom and 40 minutes. Rank by minutes.
+        minutes = {("4", "opus"): 3.0, ("6", "opus"): 40.0}
+        decision = decide(
+            [
+                _account("1", 100, fable=100),
+                _account("4", 80, weekly=54, fable=97),
+                _account("6", 85, weekly=58, fable=100),
+            ],
+            current="1",
+            samples=[Sample(0, 100), Sample(120, 100)],
+            hysteresis_pct=10.0,
+            prefer_fable=True,
+            minutes_for=lambda number, model: minutes.get((number, model)),
+        )
+        assert decision.switch_to == "6"
+        assert "about 40 minutes" in decision.detail
+
+    def test_short_landing_still_beats_a_dead_account(self):
+        decision = decide(
+            [_account("1", 100, fable=100), _account("4", 80, weekly=54, fable=97)],
+            current="1",
+            samples=[Sample(0, 100), Sample(120, 100)],
+            hysteresis_pct=10.0,
+            prefer_fable=True,
+            minutes_for=lambda number, model: 2.0,
+        )
+        assert decision.switch_to == "4"
+
     def test_full_fable_week_stays_when_every_open_session_is_out_of_fable(self):
         decision = _decide(
             [
