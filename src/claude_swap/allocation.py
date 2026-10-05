@@ -50,7 +50,7 @@ class WindowRoom:
     burn_pct_per_hour: float | None = None
     tokens_per_point: float | None = None
     tokens_per_point_source: str = "none"
-    tokens_spent: int = 0
+    tokens_spent: float = 0.0
     points_risen: float = 0.0
     tokens_left: float | None = None
     minutes_left: float | None = None
@@ -285,18 +285,20 @@ class Allocation:
     # -- demand ---------------------------------------------------------------
 
     def demand_tokens_per_minute(self, *, fable_only: bool, lookback_s: float = DEMAND_LOOKBACK_S) -> float:
+        """Cost-weighted tokens per minute over the lookback (see ``Call.weighted``)."""
         since = self.now - lookback_s
         total = sum(
-            call.total for call in self.calls
+            call.weighted for call in self.calls
             if call.at >= since and (not fable_only or _is_fable(call.model))
         )
         return total / (lookback_s / 60.0)
 
     # -- measurement ----------------------------------------------------------
 
-    def _tokens_between(self, organization: str, start: float, end: float, *, fable_only: bool) -> int:
+    def _tokens_between(self, organization: str, start: float, end: float, *, fable_only: bool) -> float:
+        """Cost-weighted tokens the organization spent in (start, end]."""
         return sum(
-            call.total for call in self.calls
+            call.weighted for call in self.calls
             if call.organization == organization
             and start < call.at <= end
             and (not fable_only or _is_fable(call.model))
@@ -312,8 +314,8 @@ class Allocation:
             previous = (at, pct)
         return out
 
-    def tokens_per_point(self, slot: str, window: str, lookback_s: float) -> tuple[float | None, int, float]:
-        """(ratio, tokens, points) measured for one slot and window.
+    def tokens_per_point(self, slot: str, window: str, lookback_s: float) -> tuple[float | None, float, float]:
+        """(ratio, weighted tokens, points) measured for one slot and window.
 
         Tokens spent by another seat of the same organization while its own
         window rose are left out, so team seats sharing one organization do
@@ -325,7 +327,7 @@ class Allocation:
         fable_only = window == "fable"
         siblings = [other for other, org in self.slot_organizations.items() if org == organization and other != slot]
         sibling_rises = [interval for other in siblings for interval in self._rising_intervals(other, window, since)]
-        tokens = 0
+        tokens = 0.0
         points = 0.0
         for start, end, rise in _segments(series, since):
             spent = self._tokens_between(organization, start, end, fable_only=fable_only)

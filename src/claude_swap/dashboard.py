@@ -154,9 +154,12 @@ const opusRoom = (a) => {
   return Math.max(0, 100 - Math.max(s ?? 0, w ?? 0));
 };
 // Fable also needs its own week open, and the switcher treats >80% as used up.
+// A refusal from the API in the last hour overrides whatever the window says.
+const fableRefused = (a) => a.fableRefusedAt != null && Date.now() / 1000 - a.fableRefusedAt < 3600;
 const fableRoom = (a) => {
   const f = pct(a.fable);
   if (f == null) return null;
+  if (fableRefused(a)) return 0;
   if (f > 80) return 0;
   const shared = opusRoom(a);
   return shared == null ? 100 - f : Math.min(100 - f, shared);
@@ -452,7 +455,7 @@ function renderNext(accounts, demand) {
     return `<div class="card none"><div class="label">${label}</div><div class="value small">Limited everywhere · ${esc(who(next.account))} opens in ${untilText(next.at)}</div><div class="sub">${activeNote}${clock(new Date(next.at).toISOString())}</div></div>`;
   });
   const pace = demand && demand.allTokensPerMinute
-    ? `<div class="card"><div class="label">Your pace, last ${Math.round((demand.lookbackSeconds || 1800) / 60)} min</div><div class="value small">${fmt(demand.allTokensPerMinute)} tokens / min</div><div class="sub">${fmt(demand.fableTokensPerMinute)} / min on Fable · ${demand.readings || 0} readings in history</div></div>`
+    ? `<div class="card"><div class="label">Your pace, last ${Math.round((demand.lookbackSeconds || 1800) / 60)} min</div><div class="value small">${fmt(demand.allTokensPerMinute)} weighted tokens / min</div><div class="sub">${fmt(demand.fableTokensPerMinute)} / min on Fable · ${demand.readings || 0} readings in history</div></div>`
     : "";
   document.getElementById("next").innerHTML = cards.join("") + pace;
 }
@@ -500,9 +503,15 @@ function renderAccounts(accounts, tokensNow) {
     const names = a.tokensSharedWith.map(n => (byNumber[n] || {}).email || n).join(", ");
     return `<span class="pill" title="Claude Code's logs record the organization, not the seat. This is the whole ${esc(a.organization)} organization's total and cannot be split between its seats: ${esc(names)}.">${esc(a.organization)} total</span>`;
   };
-  const windowCell = (w, model) => w ? `${bar(pct(w))}<div class="muted nowrap">${resetCell(w)}</div>` : `<span class="muted">${model === "fable" ? "not on this plan" : "—"}</span>`;
+  const windowCell = (w, model, a) => {
+    if (!w) return `<span class="muted">${model === "fable" ? "not on this plan" : "—"}</span>`;
+    const refused = model === "fable" && a && fableRefused(a)
+      ? `<div class="pill bad" title="Claude Code's log shows the API refused Fable on this organization and asked for usage credits. Treated as no Fable room for an hour.">refused ${age(Date.now() / 1000 - a.fableRefusedAt)}</div>`
+      : "";
+    return `${bar(pct(w))}<div class="muted nowrap">${resetCell(w)}</div>${refused}`;
+  };
   document.getElementById("accounts").innerHTML = `<tr><th>Account</th><th>Session</th><th>Weekly</th><th>Fable</th><th class="num">Tokens</th><th class="num">Calls</th><th>Read</th></tr>` +
-    sortAccounts(accounts).map(a => `<tr class="${a.active ? "active" : ""}"><td class="who"><div>${esc(who(a))}${a.active ? ' <span class="pill ok">active</span>' : ""}</div><div class="muted">${esc(a.tierLabel || "plan unknown")}</div><div>${roomPill(a)}</div></td><td>${windowCell(a.session)}</td><td>${windowCell(a.weekly)}</td><td>${windowCell(a.fable, "fable")}</td><td class="num">${fmt(a.tokens && a.tokens.total)}<div class="muted nowrap">${a.tokens ? fmt(a.tokens.output) + " out" : ""}</div><div>${sharedNote(a)}</div></td><td class="num">${fmt(a.tokens && a.tokens.calls)}</td><td class="muted nowrap">${age(a.readingAgeSeconds)}${a.lastError ? " · " + esc(a.lastError) : ""}</td></tr>`).join("") +
+    sortAccounts(accounts).map(a => `<tr class="${a.active ? "active" : ""}"><td class="who"><div>${esc(who(a))}${a.active ? ' <span class="pill ok">active</span>' : ""}</div><div class="muted">${esc(a.tierLabel || "plan unknown")}</div><div>${roomPill(a)}</div></td><td>${windowCell(a.session)}</td><td>${windowCell(a.weekly)}</td><td>${windowCell(a.fable, "fable", a)}</td><td class="num">${fmt(a.tokens && a.tokens.total)}<div class="muted nowrap">${a.tokens ? fmt(a.tokens.output) + " out" : ""}</div><div>${sharedNote(a)}</div></td><td class="num">${fmt(a.tokens && a.tokens.calls)}</td><td class="muted nowrap">${age(a.readingAgeSeconds)}${a.lastError ? " · " + esc(a.lastError) : ""}</td></tr>`).join("") +
     (tokensNow.unattributed && tokensNow.unattributed.calls ? `<tr><td class="muted">Sessions with no organization marker</td><td></td><td></td><td></td><td class="num">${fmt(tokensNow.unattributed.total)}</td><td class="num">${fmt(tokensNow.unattributed.calls)}</td><td></td></tr>` : "");
 }
 
@@ -519,7 +528,7 @@ function renderRoom(accounts, lookback) {
     }
   }
   const source = (w) => w.tokensPerPointSource === "measured" ? "" : w.tokensPerPointSource === "same-tier" ? " <span class=\\"muted\\">(est. from same plan)</span>" : w.tokensPerPointSource === "any-account" ? " <span class=\\"muted\\">(est. from other accounts)</span>" : "";
-  document.getElementById("roomHint").textContent = `Tokens per 1% are measured as tokens spent while that window climbed, over the last ${untilText(Date.now() + lookback * 1000)}. Time left divides the remaining tokens by your pace over the last 30 minutes. Climb is how fast the window rose in the lookback.`;
+  document.getElementById("roomHint").textContent = `Tokens here are cost-weighted (output ×5, cache write ×1.25, cache read ×0.1, in input-token units), which is what the limits track. Tokens per 1% are measured as weighted tokens spent while that window climbed, over the last ${untilText(Date.now() + lookback * 1000)}. Time left divides the remaining weighted tokens by your weighted pace over the last 30 minutes. Climb is how fast the window rose in the lookback.`;
   let lastAccount = null;
   document.getElementById("room").innerHTML = `<tr><th>Account</th><th>Window</th><th class="num">Used</th><th class="num">Climb</th><th class="num">Tokens per 1%</th><th class="num">Tokens left</th><th class="num">Time left</th><th>Measured on</th></tr>` +
     rows.map(({ a, key, w }) => {
@@ -655,6 +664,7 @@ class StateReader:
             files = len(self.ledger.cursors)
             scanned_at = self.ledger.last_scan_at
             calls = list(self.ledger.calls)
+            refusals = list(self.ledger.refusals)
             history = self._history(now)
         return read_state(
             self.switcher,
@@ -662,6 +672,7 @@ class StateReader:
             token_files=files,
             token_age_s=now - scanned_at,
             calls=calls,
+            refusals=refusals,
             history=history,
             lookback_s=window_s,
         )
@@ -674,6 +685,7 @@ def read_state(
     token_files: int = 0,
     token_age_s: float | None = None,
     calls: list[tokens.Call] | None = None,
+    refusals: list[tokens.Refusal] | None = None,
     history: list[allocation.Reading] | None = None,
     lookback_s: float = 24 * 3600.0,
 ) -> dict:
@@ -683,6 +695,12 @@ def read_state(
     samples = _samples(switcher.backup_dir, snapshot.active_number)
     now = datetime.now(timezone.utc).timestamp()
     by_organization = (token_summary or {}).get("byOrganization", {})
+    # Latest Fable refusal per organization in the last hour. The usage
+    # endpoint can report Fable room on an account the API refuses.
+    refused_fable: dict[str, float] = {}
+    for refusal in refusals or []:
+        if "fable" in refusal.model.lower() and refusal.at >= now - 3600.0:
+            refused_fable[refusal.organization] = max(refused_fable.get(refusal.organization, 0.0), refusal.at)
     tiers = {account.number: _tier(switcher, account.number, account.email) for account in snapshot.accounts}
     # Session logs name the organization, not the account. Slots that share
     # an organization (several seats on one team) share one token total.
@@ -716,6 +734,7 @@ def read_state(
             "session": _window(usage, "five_hour"),
             "weekly": _window(usage, "seven_day"),
             "fable": _fable(usage),
+            "fableRefusedAt": refused_fable.get(account.org_uuid or ""),
             "tokens": organization_tokens,
             "tokensSharedWith": [
                 number for number in slots_by_organization.get(account.org_uuid or "", [])

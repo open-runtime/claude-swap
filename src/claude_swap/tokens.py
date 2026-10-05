@@ -47,6 +47,38 @@ class Call:
             + self.cache_creation_tokens
         )
 
+    @property
+    def weighted(self) -> float:
+        """Tokens weighted by their relative cost, in input-token units.
+
+        Anthropic prices output at 5x input, a cache write at 1.25x, and a
+        cache read at 0.1x, and usage limits track cost rather than raw
+        count. Raw totals are 96% cache reads here, so a shift toward or
+        away from cached context would swing a raw ratio by an order of
+        magnitude while the real spend barely moved.
+        """
+        return (
+            self.input_tokens
+            + 5.0 * self.output_tokens
+            + 0.1 * self.cache_read_tokens
+            + 1.25 * self.cache_creation_tokens
+        )
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """The API refused a model on this organization and Claude Code fell back.
+
+    Recorded from ``model_consent_fallback`` system rows. The usage endpoint
+    can show a Fable window with room while the API still answers
+    ``model_requires_usage_credit``; this is the only local record of that.
+    """
+
+    at: float
+    organization: str
+    model: str
+    fallback_model: str
+
 
 @dataclass
 class _FileCursor:
@@ -63,7 +95,18 @@ class TokenLedger:
     horizon_s: float = 7 * 24 * 3600.0
     cursors: dict[str, _FileCursor] = field(default_factory=dict)
     calls: list[Call] = field(default_factory=list)
+    refusals: list[Refusal] = field(default_factory=list)
     last_scan_at: float = 0.0
+
+    def refused_since(self, organization: str, since: float, model_contains: str = "fable") -> float | None:
+        """Latest refusal time for ``model_contains`` on the organization after ``since``."""
+        times = [
+            refusal.at for refusal in self.refusals
+            if refusal.organization == organization
+            and refusal.at >= since
+            and model_contains in refusal.model.lower()
+        ]
+        return max(times) if times else None
 
     def refresh(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -87,6 +130,7 @@ class TokenLedger:
                     continue
                 self._read(path, cursor)
         self.calls = [call for call in self.calls if call.at >= cutoff]
+        self.refusals = [refusal for refusal in self.refusals if refusal.at >= cutoff]
         for key in list(self.cursors):
             if key not in seen:
                 del self.cursors[key]
@@ -114,6 +158,22 @@ class TokenLedger:
                 organization = (row.get("attachment") or {}).get("organizationUuid")
                 if isinstance(organization, str):
                     cursor.organization = organization
+                continue
+            if '"model_consent_fallback"' in line:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                stamp = _parse_timestamp(row.get("timestamp"))
+                if stamp is not None and row.get("type") == "system":
+                    self.refusals.append(
+                        Refusal(
+                            at=stamp,
+                            organization=cursor.organization,
+                            model=str(row.get("originalModel") or ""),
+                            fallback_model=str(row.get("fallbackModel") or ""),
+                        )
+                    )
                 continue
             if '"usage"' not in line or '"assistant"' not in line:
                 continue

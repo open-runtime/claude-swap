@@ -29,6 +29,22 @@ def _assistant(stamp: str, model: str, **usage) -> str:
     })
 
 
+def test_token_ledger_records_fable_refusals_with_their_organization(tmp_path):
+    session = tmp_path / "project" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text("\n".join([
+        json.dumps({"type": "attachment", "attachment": {"type": "credential_org", "organizationUuid": "org-a"}}),
+        json.dumps({"type": "system", "subtype": "model_consent_fallback", "timestamp": "2026-10-05T19:46:59Z", "originalModel": "claude-fable-5-1", "fallbackModel": "claude-opus-5-5"}),
+    ]) + "\n")
+    now = 1791230400.0
+    ledger = TokenLedger(tmp_path)
+    ledger.refresh(now)
+    assert len(ledger.refusals) == 1
+    assert ledger.refusals[0].organization == "org-a"
+    assert ledger.refused_since("org-a", now - 3600) is not None
+    assert ledger.refused_since("org-b", now - 3600) is None
+
+
 def test_token_ledger_attributes_calls_to_the_signed_in_organization(tmp_path):
     session = tmp_path / "project" / "session.jsonl"
     session.parent.mkdir(parents=True)

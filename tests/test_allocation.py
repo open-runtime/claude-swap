@@ -17,7 +17,14 @@ NOW = 1_791_230_400.0  # 2026-10-05T20:00:00Z
 
 
 def _call(at: float, organization: str, model: str = "claude-opus-5-5", total: int = 1_000_000) -> Call:
-    return Call(at=at, organization=organization, model=model, input_tokens=0, output_tokens=total, cache_read_tokens=0, cache_creation_tokens=0)
+    # Plain input tokens weigh 1.0, so the weighted figure equals ``total``.
+    return Call(at=at, organization=organization, model=model, input_tokens=total, output_tokens=0, cache_read_tokens=0, cache_creation_tokens=0)
+
+
+def test_weighted_tokens_follow_relative_cost():
+    call = Call(at=0, organization="o", model="m", input_tokens=100, output_tokens=10, cache_read_tokens=1000, cache_creation_tokens=40)
+    assert call.total == 1150
+    assert call.weighted == 100 + 50 + 100 + 50
 
 
 def test_tokens_per_point_measures_tokens_spent_while_the_window_rose():

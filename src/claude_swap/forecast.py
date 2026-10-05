@@ -13,7 +13,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-PICKUP_S = 90.0
+# Time a switch needs to land before the window fills: about 30s for a
+# running Claude Code to pick up the new login, plus the poll interval, since
+# the next reading is up to 60s away and a burst in that gap is invisible.
+# 0% to 16% in three minutes was observed on a Max 20x account; 90s was tight.
+PICKUP_S = 150.0
 QUIET_CEILING_PCT = 92.0
 LOUD_FLOOR_PCT = 70.0
 # An account above this Fable utilization is not a place to send Fable work.
@@ -363,6 +367,17 @@ def decide(
     fable_available = prefer_fable and any(fable_peer(account) for account in accounts)
     leave, escaping, because = _should_leave(active, samples, prefer_fable=prefer_fable)
     fable_only = because.startswith("fable")
+    short_landing = False
+    if fable_only and not any(fable_peer(account) for account in accounts if account.number != current):
+        # No peer lasts the full ten minutes. A short Fable landing still beats
+        # staying where Fable has already failed, so take the longest one.
+        short = [account for account in accounts if account.number != current and _fable_usable(account)]
+        if short:
+            short_landing = True
+            fable_available = True
+
+            def fable_peer(account: AccountSnapshot, _short=frozenset(a.number for a in short)) -> bool:  # noqa: F811
+                return account.number in _short
     if fable_only and not any(fable_peer(account) for account in accounts if account.number != current):
         phrase = _fill_phrase(active, samples)
         return Decision(
@@ -465,6 +480,8 @@ def decide(
     phrase = _fill_phrase(active, samples)
     minutes = minutes_for(chosen.number, model) if minutes_for else None
     lasting = f", about {minutes:.0f} minutes at the current pace" if minutes is not None else ""
+    if short_landing:
+        lasting += "; no account lasts longer, so this is a short landing"
     if landing_fable:
         detail = f"{phrase}; switching to account {chosen.number}, which has the most Fable room{lasting}"
     elif prefer_fable:

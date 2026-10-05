@@ -100,10 +100,10 @@ class TestForecastPolicy:
         assert decision.switch_to == "2"
 
     def test_projected_fill_beyond_pickup_stays(self):
-        # 60% -> 75% in 60s leaves 25 points, about 100s, outside the 90s window.
+        # 70% -> 76% in 60s leaves 24 points, about 240s, outside the 150s window.
         decision = _decide(
-            [_account("1", 75, fable=10), _account("2", 0, fable=0)],
-            [Sample(0, 60), Sample(60, 75)],
+            [_account("1", 76, fable=10), _account("2", 0, fable=0)],
+            [Sample(0, 70), Sample(60, 76)],
         )
         assert decision.switch_to is None
 

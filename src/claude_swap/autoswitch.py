@@ -57,6 +57,8 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+# How long a Fable refusal keeps an organization out of Fable landings.
+FABLE_REFUSAL_HOLD_S = 3600.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -1218,9 +1220,10 @@ class AutoSwitchEngine:
                     NoSwitchEvent(reason=decision.reason, detail=decision.detail)
                 )
                 return TickOutcome.NO_ACTION
-            if not decision.escaping_limit and self._in_cooldown(state):
-                self._emit(NoSwitchEvent(reason="cooldown", detail=decision.detail))
-                return TickOutcome.NO_ACTION
+            # No cooldown for forecast leaves. The strategy has its own
+            # anti-flap gates (hysteresis, the minutes-of-room floor, and the
+            # no-return bar), and a cooldown here trapped a leave on a team
+            # seat that filled in nine minutes, riding it to a hard limit.
             if decision.escaping_limit:
                 # at-limit skips the cooldown in _perform, so a full session
                 # does not sit out the rest of the cooldown window.
@@ -2187,7 +2190,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "forecast") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2311,6 +2314,7 @@ class AutoSwitchEngine:
             account = forecast.snapshot(str(number), usage.get(str(number)))
             if account is not None and all(existing.number != account.number for existing in accounts):
                 accounts.append(account)
+        accounts = self._apply_fable_refusals(accounts)
         prefer_fable = any(name.lower() in ("fable", "all") for name in self._models)
         return forecast.decide(
             accounts,
@@ -2321,6 +2325,42 @@ class AutoSwitchEngine:
             minutes_for=self._minutes_for(accounts),
         )
 
+    def _fresh_ledger(self) -> tokens.TokenLedger | None:
+        try:
+            if self._ledger is None:
+                self._ledger = tokens.TokenLedger(tokens.default_root())
+            now = self.clock()
+            if now - self._ledger.last_scan_at >= 60.0:
+                self._ledger.refresh(now)
+            return self._ledger
+        except Exception as error:  # advisory data; never block a tick
+            _logger.debug("token ledger unavailable: %s", error)
+            return None
+
+    def _apply_fable_refusals(
+        self, accounts: list[forecast.AccountSnapshot]
+    ) -> list[forecast.AccountSnapshot]:
+        """Treat a Fable week as full for an hour after the API refused Fable
+        on that organization.
+
+        On Oct 5 two Max 20x accounts showed Fable at 0% and the API answered
+        every Fable request with ``model_requires_usage_credit``. The usage
+        endpoint cannot show that; Claude Code's session log can.
+        """
+        ledger = self._fresh_ledger()
+        if ledger is None or not ledger.refusals:
+            return accounts
+        now = self.clock()
+        sequence = (self.switcher._get_sequence_data() or {}).get("accounts", {})
+        out: list[forecast.AccountSnapshot] = []
+        for account in accounts:
+            organization = (sequence.get(account.number) or {}).get("organizationUuid") or ""
+            refused_at = ledger.refused_since(organization, now - FABLE_REFUSAL_HOLD_S) if organization else None
+            if refused_at is not None and account.fable is not None:
+                account = replace(account, fable=forecast.Window(pct=100.0))
+            out.append(account)
+        return out
+
     def _minutes_for(self, accounts: list[forecast.AccountSnapshot]) -> forecast.MinutesFor | None:
         """Minutes of room per account at this machine's current token demand.
 
@@ -2328,11 +2368,9 @@ class AutoSwitchEngine:
         falls back to percent headroom alone.
         """
         try:
-            if self._ledger is None:
-                self._ledger = tokens.TokenLedger(tokens.default_root())
+            if self._fresh_ledger() is None:
+                return None
             now = self.clock()
-            if now - self._ledger.last_scan_at >= 60.0:
-                self._ledger.refresh(now)
             store = self.switcher._usage_store
             history = allocation.readings_from_history(store.history(now - 24 * 3600.0))
             if not history:
