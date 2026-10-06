@@ -162,6 +162,14 @@ const settleResets = (a) => {
       a[key] = { pct: 0, resetsAt: null, resetAt: w.resetsAt, awaitingRead: true };
     }
   }
+  // Claude Code reported a request hitting a limit after this reading was
+  // taken (the usage endpoint can lag by minutes, under a 429 by an hour).
+  // The window is full now whatever the reading says.
+  const hit = a.limitHit;
+  if (hit && (a.readAt == null || a.readAt < hit.at)) {
+    const key = hit.window === "weekly" ? "weekly" : hit.window === "fable" ? "fable" : "session";
+    if (a[key]) a[key] = { ...a[key], pct: 100, awaitingRead: false, hitAt: hit.at, hitText: hit.text };
+  }
   return a;
 };
 // Room for the shared windows Opus draws from: session and weekly. 0 when either is full.
@@ -531,7 +539,10 @@ function renderAccounts(accounts, tokensNow) {
     const refused = model === "fable" && a && fableRefused(a)
       ? `<div class="pill bad" title="Claude Code's log shows the API refused Fable on this organization and asked for usage credits. Treated as no Fable room for an hour.">refused ${age(Date.now() / 1000 - a.fableRefusedAt)}</div>`
       : "";
-    return `${bar(pct(w))}<div class="muted nowrap">${resetCell(w)}</div>${refused}`;
+    const hit = w.hitAt != null
+      ? `<div class="pill bad" title="${esc(w.hitText || "")} This came from Claude Code's session log, after the last usage reading, so the window is shown full.">limit hit ${clock(new Date(w.hitAt * 1000).toISOString())}</div>`
+      : "";
+    return `${bar(pct(w))}<div class="muted nowrap">${resetCell(w)}</div>${hit}${refused}`;
   };
   document.getElementById("accounts").innerHTML = `<tr><th>Account</th><th>Session</th><th>Weekly</th><th>Fable</th><th class="num">Tokens</th><th class="num">Calls</th><th>Read</th></tr>` +
     sortAccounts(accounts).map(a => `<tr class="${a.active ? "active" : ""}"><td class="who"><div>${esc(who(a))}${a.active ? ' <span class="pill ok">active</span>' : ""}</div><div class="muted">${esc(a.tierLabel || "plan unknown")}</div><div>${roomPill(a)}</div></td><td>${windowCell(a.session)}</td><td>${windowCell(a.weekly)}</td><td>${windowCell(a.fable, "fable", a)}</td><td class="num">${fmt(a.tokens && a.tokens.total)}<div class="muted nowrap">${a.tokens ? fmt(a.tokens.output) + " out" : ""}</div><div>${sharedNote(a)}</div></td><td class="num">${fmt(a.tokens && a.tokens.calls)}</td><td class="muted nowrap">${age(a.readingAgeSeconds)}${a.lastError ? " · " + esc(a.lastError) : ""}</td></tr>`).join("") +
@@ -693,6 +704,7 @@ class StateReader:
             scanned_at = self.ledger.last_scan_at
             calls = list(self.ledger.calls)
             refusals = list(self.ledger.refusals)
+            limit_hits = list(self.ledger.limit_hits)
             history = self._history(now)
         return read_state(
             self.switcher,
@@ -701,6 +713,7 @@ class StateReader:
             token_age_s=now - scanned_at,
             calls=calls,
             refusals=refusals,
+            limit_hits=limit_hits,
             history=history,
             lookback_s=window_s,
         )
@@ -714,6 +727,7 @@ def read_state(
     token_age_s: float | None = None,
     calls: list[tokens.Call] | None = None,
     refusals: list[tokens.Refusal] | None = None,
+    limit_hits: list[tokens.LimitHit] | None = None,
     history: list[allocation.Reading] | None = None,
     lookback_s: float = 24 * 3600.0,
 ) -> dict:
@@ -729,6 +743,13 @@ def read_state(
     for refusal in refusals or []:
         if "fable" in refusal.model.lower() and refusal.at >= now - 3600.0:
             refused_fable[refusal.organization] = max(refused_fable.get(refusal.organization, 0.0), refusal.at)
+    # Latest limit Claude Code reported hitting, per organization, in the
+    # last six hours. The page compares it with when the usage reading was
+    # taken: a hit after the reading means the window is full now.
+    latest_hit: dict[str, tokens.LimitHit] = {}
+    for hit in limit_hits or []:
+        if hit.at >= now - 6 * 3600.0 and (hit.organization not in latest_hit or hit.at > latest_hit[hit.organization].at):
+            latest_hit[hit.organization] = hit
     tiers = {account.number: _tier(switcher, account.number, account.email) for account in snapshot.accounts}
     # Session logs name the organization, not the account. Slots that share
     # an organization (several seats on one team) share one token total.
@@ -763,6 +784,11 @@ def read_state(
             "weekly": _window(usage, "seven_day"),
             "fable": _fable(usage),
             "fableRefusedAt": refused_fable.get(account.org_uuid or ""),
+            "limitHit": (
+                {"at": hit.at, "window": hit.window, "text": hit.text}
+                if (hit := latest_hit.get(account.org_uuid or "")) is not None
+                else None
+            ),
             "tokens": organization_tokens,
             "tokensSharedWith": [
                 number for number in slots_by_organization.get(account.org_uuid or "", [])

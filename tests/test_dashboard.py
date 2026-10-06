@@ -52,6 +52,38 @@ def test_token_ledger_records_fable_refusals_with_their_organization(tmp_path):
     assert ledger.refused_since("org-b", now - 5 * 3600) is None
 
 
+def test_token_ledger_records_limits_claude_code_reported_hitting(tmp_path):
+    session = tmp_path / "project" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+
+    def synthetic(stamp: str, text: str) -> str:
+        return json.dumps({
+            "type": "assistant", "timestamp": stamp,
+            "message": {"model": "<synthetic>", "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "content": [{"type": "text", "text": text}]},
+        })
+
+    session.write_text("\n".join([
+        json.dumps({"type": "attachment", "attachment": {"type": "credential_org", "organizationUuid": "org-a"}}),
+        synthetic("2026-10-06T19:03:10Z", "You've hit your weekly limit · resets 9pm (America/New_York)"),
+        synthetic("2026-10-06T19:03:40Z", "You've hit your session limit · resets 3:40pm (America/New_York)"),
+        synthetic("2026-10-06T19:04:00Z", "You've reached your Fable 5 limit. Switch to another model, or manage usage credits."),
+        synthetic("2026-10-06T19:04:30Z", "No response requested."),
+        json.dumps({"type": "attachment", "attachment": {"type": "credential_org", "organizationUuid": "org-b"}}),
+        synthetic("2026-10-06T19:05:00Z", "You've hit your weekly limit · resets 9pm (America/New_York)"),
+    ]) + "\n")
+    now = 1791315200.0  # 2026-10-06T19:33:20Z, half an hour after the hits
+    ledger = TokenLedger(tmp_path)
+    ledger.refresh(now)
+    assert [hit.window for hit in ledger.limit_hits] == ["weekly", "session", "fable", "weekly"]
+    assert [hit.organization for hit in ledger.limit_hits] == ["org-a", "org-a", "org-a", "org-b"]
+    assert ledger.calls == []  # synthetic rows carry no tokens
+    latest = ledger.limit_hit_since("org-a", now - 3600)
+    assert latest is not None and latest.window == "fable"
+    assert ledger.limit_hit_since("org-a", now - 60) is None
+    assert ledger.limit_hit_since("org-c", now - 3600) is None
+
+
 def test_token_ledger_attributes_calls_to_the_signed_in_organization(tmp_path):
     session = tmp_path / "project" / "session.jsonl"
     session.parent.mkdir(parents=True)

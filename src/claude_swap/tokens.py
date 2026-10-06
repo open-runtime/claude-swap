@@ -15,6 +15,7 @@ are kept per file, so a refresh only parses what was appended since last time.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -84,6 +85,54 @@ class Refusal:
     fallback_model: str
 
 
+# "You've hit your weekly limit · resets 9pm (America/New_York)",
+# "You've hit your session limit · resets 3:40pm (America/New_York)",
+# "You've reached your Fable limit. Switch to another model, or ..."
+_LIMIT_RE = re.compile(r"you'?ve (?:hit|reached) your (.+?) limit", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class LimitHit:
+    """Claude Code was told a request hit a usage limit on this organization.
+
+    Recorded from the synthetic ``assistant`` rows Claude Code writes in
+    place of a reply. ``window`` is ``"session"``, ``"weekly"`` or
+    ``"fable"``, or the raw phrase when it is none of those. The usage
+    endpoint can lag this by many minutes, and under a 429 by an hour; the
+    session log has it the moment it happens, which is why the rotator
+    reads it.
+    """
+
+    at: float
+    organization: str
+    window: str
+    text: str
+
+
+def _limit_hit(message: dict, at: float, organization: str) -> LimitHit | None:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    for part in content:
+        text = part.get("text") if isinstance(part, dict) else None
+        if not isinstance(text, str):
+            continue
+        match = _LIMIT_RE.search(text)
+        if match is None:
+            continue
+        phrase = match.group(1).strip().lower()
+        if "fable" in phrase:
+            window = "fable"
+        elif "week" in phrase:
+            window = "weekly"
+        elif "session" in phrase:
+            window = "session"
+        else:
+            window = phrase
+        return LimitHit(at=at, organization=organization, window=window, text=text[:160])
+    return None
+
+
 @dataclass
 class _FileCursor:
     offset: int = 0
@@ -100,6 +149,7 @@ class TokenLedger:
     cursors: dict[str, _FileCursor] = field(default_factory=dict)
     calls: list[Call] = field(default_factory=list)
     refusals: list[Refusal] = field(default_factory=list)
+    limit_hits: list[LimitHit] = field(default_factory=list)
     last_scan_at: float = 0.0
 
     def refused_since(self, organization: str, since: float, model_contains: str = "fable") -> float | None:
@@ -111,6 +161,14 @@ class TokenLedger:
             and model_contains in refusal.model.lower()
         ]
         return max(times) if times else None
+
+    def limit_hit_since(self, organization: str, since: float) -> LimitHit | None:
+        """The latest limit hit on the organization after ``since``, or None."""
+        hits = [
+            hit for hit in self.limit_hits
+            if hit.organization == organization and hit.at >= since
+        ]
+        return max(hits, key=lambda hit: hit.at) if hits else None
 
     def refresh(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -135,6 +193,7 @@ class TokenLedger:
                 self._read(path, cursor)
         self.calls = [call for call in self.calls if call.at >= cutoff]
         self.refusals = [refusal for refusal in self.refusals if refusal.at >= cutoff]
+        self.limit_hits = [hit for hit in self.limit_hits if hit.at >= cutoff]
         for key in list(self.cursors):
             if key not in seen:
                 del self.cursors[key]
@@ -193,6 +252,10 @@ class TokenLedger:
                 continue
             model = message.get("model") or "unknown"
             if model == "<synthetic>":
+                # No tokens, but this is where Claude Code reports a limit.
+                hit = _limit_hit(message, stamp, cursor.organization)
+                if hit is not None:
+                    self.limit_hits.append(hit)
                 continue
 
             def count(key: str) -> int:

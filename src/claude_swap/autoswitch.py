@@ -60,6 +60,12 @@ STATE_SCHEMA_VERSION = 1
 # How long a Fable refusal keeps an organization out of Fable landings.
 FABLE_REFUSAL_HOLD_S = 3600.0
 
+# How far back the engine looks for a limit Claude Code reported hitting on
+# an organization. A hit outranks any usage reading taken before it; a
+# reading taken after it speaks for itself, so this only bounds the search,
+# it is not how long the window is held full.
+LIMIT_HIT_LOOKBACK_S = 6 * 3600.0
+
 _logger = logging.getLogger("claude-swap")
 
 # Systemic freshen refusals, MOST ACTIONABLE FIRST. Deterministic conditions
@@ -675,6 +681,9 @@ class AutoSwitchEngine:
         # Token ledger for the forecast strategy's minutes-of-room estimate.
         # Built on first use; the first scan reads every recent session log.
         self._ledger: tokens.TokenLedger | None = None
+        # (organization, hit time) pairs already announced, so a hit that
+        # keeps overriding a frozen reading is logged once, not every tick.
+        self._limit_hits_announced: set[tuple[str, float]] = set()
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
@@ -2319,6 +2328,7 @@ class AutoSwitchEngine:
             if account is not None and all(existing.number != account.number for existing in accounts):
                 accounts.append(account)
         accounts = self._apply_fable_refusals(accounts)
+        accounts = self._apply_limit_hits(accounts)
         prefer_fable = any(name.lower() in ("fable", "all") for name in self._models)
         return forecast.decide(
             accounts,
@@ -2362,6 +2372,55 @@ class AutoSwitchEngine:
             refused_at = ledger.refused_since(organization, now - FABLE_REFUSAL_HOLD_S) if organization else None
             if refused_at is not None and account.fable is not None:
                 account = replace(account, fable=forecast.Window(pct=100.0))
+            out.append(account)
+        return out
+
+    def _apply_limit_hits(
+        self, accounts: list[forecast.AccountSnapshot]
+    ) -> list[forecast.AccountSnapshot]:
+        """Treat a window as full once Claude Code was told a request hit it.
+
+        On Oct 6 slot 1's weekly reached 100% at 3:03 PM while the rotator
+        held a 2:41 PM reading of 88%: the usage endpoint had answered 429
+        with an hour's Retry-After, so nothing fresher could arrive, and the
+        forecast sat on the dead account for twenty minutes. Claude Code
+        logged the refusal the moment it happened. A hit outranks any
+        reading taken before it; a reading taken after it speaks for itself.
+        """
+        ledger = self._fresh_ledger()
+        if ledger is None or not ledger.limit_hits:
+            return accounts
+        now = self.clock()
+        sequence = (self.switcher._get_sequence_data() or {}).get("accounts", {})
+        entries = self.switcher.usage_entries_by_account(fetch=set())
+        out: list[forecast.AccountSnapshot] = []
+        for account in accounts:
+            organization = (sequence.get(account.number) or {}).get("organizationUuid") or ""
+            hit = ledger.limit_hit_since(organization, now - LIMIT_HIT_LOOKBACK_S) if organization else None
+            if hit is None:
+                out.append(account)
+                continue
+            entry = entries.get(account.number)
+            if entry is not None and entry.fetched_at is not None and entry.fetched_at >= hit.at:
+                out.append(account)
+                continue
+            full = forecast.Window(pct=100.0)
+            if hit.window == "weekly":
+                account = replace(account, seven_day=full)
+            elif hit.window == "fable":
+                if account.fable is not None:
+                    account = replace(account, fable=full)
+            else:
+                account = replace(account, five_hour=full)
+            key = (organization, hit.at)
+            if key not in self._limit_hits_announced:
+                self._limit_hits_announced.add(key)
+                _logger.warning(
+                    "Claude Code hit the %s limit on account %s at %s; treating it as full until a newer usage reading",
+                    hit.window,
+                    account.number,
+                    time.strftime("%H:%M:%S", time.localtime(hit.at)),
+                )
             out.append(account)
         return out
 

@@ -7012,3 +7012,76 @@ def test_forecast_rejects_a_stale_landing_reading(temp_home):
     assert outcome is TickOutcome.SWITCHED
     assert harness.active_number() == 3
 
+
+def _limit_hit_harness(temp_home, tmp_path, *, hit_at: float, read_at: float):
+    """Slot 1 on Oct 6: the weekly reached 100% at 3:03 PM while the store
+    held a 2:41 PM reading of 88% behind an hour-long 429 backoff. Claude
+    Code logged "You've hit your weekly limit" the moment it happened."""
+    from claude_swap.tokens import LimitHit, TokenLedger
+
+    harness = EngineHarness(temp_home, strategy="forecast", model="Fable")
+    harness.seed(1, "a@example.com")
+    harness.seed(2, "b@example.com")
+    harness.make_live("a@example.com", 1)
+    # Limit hits are keyed by organization, so slot 1 needs one, in the
+    # registry and on the live login alike (identity is email + org).
+    data = harness.switcher._get_sequence_data()
+    data["accounts"]["1"]["organizationUuid"] = "org-a"
+    harness.switcher._write_json(harness.switcher.sequence_file, data)
+    live = temp_home / ".claude.json"
+    live_config = json.loads(live.read_text())
+    live_config["oauthAccount"]["organizationUuid"] = "org-a"
+    live.write_text(json.dumps(live_config))
+
+    ledger = TokenLedger(tmp_path / "no-logs")
+    ledger.limit_hits.append(LimitHit(
+        at=hit_at, organization="org-a", window="weekly",
+        text="You've hit your weekly limit · resets 9pm (America/New_York)",
+    ))
+    ledger.last_scan_at = harness.clock.now  # already scanned this tick
+    harness.engine._ledger = ledger
+
+    usage = {
+        "1": {"five_hour": {"pct": 48}, "seven_day": {"pct": 88}, "scoped": [{"name": "Fable", "pct": 66}]},
+        "2": {"five_hour": {"pct": 0}, "seven_day": {"pct": 25}, "scoped": [{"name": "Fable", "pct": 45}]},
+    }
+
+    def entries(fetch=None, scheduled=False):
+        now = harness.clock.now
+        # The active row is 429-frozen: old, but deliberately trusted.
+        active = UsageEntry(
+            last_good=usage["1"], fetched_at=read_at, age_s=now - read_at,
+            last_error="http-429", trust_extended=True,
+        )
+        landing_stamp = now + (1 if fetch and len(fetch) == 1 else 0)
+        peer = UsageEntry(last_good=usage["2"], fetched_at=landing_stamp, age_s=0.0)
+        return {"1": active, "2": peer}
+
+    return harness, entries
+
+
+def test_forecast_leaves_when_claude_code_reports_a_limit_the_reading_missed(temp_home, tmp_path):
+    now = 1_000_000.0
+    harness, entries = _limit_hit_harness(temp_home, tmp_path, hit_at=now - 120, read_at=now - 1500)
+    harness.clock.now = now
+    with patch.object(harness.switcher, "usage_entries_by_account", side_effect=entries):
+        outcome = harness.engine.tick()
+    assert outcome is TickOutcome.SWITCHED
+    assert harness.active_number() == 2
+    switched = next(event for event in harness.events if isinstance(event, SwitchEvent))
+    # A reported hit is a hard limit, so it takes the at-limit escape, not a
+    # forecast leave: landing rules for a nearly-full peer are relaxed.
+    assert switched.trigger == "at-limit"
+
+
+def test_forecast_trusts_a_reading_taken_after_the_reported_limit(temp_home, tmp_path):
+    # Same hit, but the store has since read the account again and it says
+    # 88%: the newer reading wins and the engine holds.
+    now = 1_000_000.0
+    harness, entries = _limit_hit_harness(temp_home, tmp_path, hit_at=now - 1500, read_at=now - 120)
+    harness.clock.now = now
+    with patch.object(harness.switcher, "usage_entries_by_account", side_effect=entries):
+        outcome = harness.engine.tick()
+    assert outcome is TickOutcome.NO_ACTION
+    assert harness.active_number() == 1
+
