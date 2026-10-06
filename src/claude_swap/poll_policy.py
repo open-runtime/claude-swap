@@ -146,6 +146,15 @@ ESCALATION_MARGIN_PCT = 15.0
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
 
+# Alternate (non-active) accounts the engine refreshes per tick. One was not
+# enough: 18 accounts on the 600s candidate cadence need 1.8 fetches a
+# minute against a ~60s tick, so the due queue only ever grew and a session
+# that had reset sat at its pre-reset reading for 12 minutes. Two covers
+# that pool with room to spare, and each account's own cadence is unchanged
+# (the queue drains faster; no token is asked more often), so the usage
+# endpoint's per-token rate limit is not pressed any harder.
+ALTERNATE_POLLS_PER_TICK = 2
+
 
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
     """Utilization of the binding (worst) relevant window, or None."""

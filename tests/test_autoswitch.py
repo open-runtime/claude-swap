@@ -693,9 +693,8 @@ class TestAdaptiveScheduler:
     def _harness(self, temp_home, monkeypatch, accounts=3, **settings_kwargs):
         monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
         h = EngineHarness(temp_home, **settings_kwargs)
-        emails = ["a@example.com", "b@example.com", "c@example.com"]
         for num in range(1, accounts + 1):
-            h.seed(num, emails[num - 1])
+            h.seed(num, f"{chr(ord('a') + num - 1)}@example.com")
         h.make_live("a@example.com", 1)
         monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
         return h
@@ -719,26 +718,28 @@ class TestAdaptiveScheduler:
         ):
             return h.engine.tick()
 
-    def test_baseline_fetches_active_plus_one_candidate(self, temp_home, monkeypatch):
-        h = self._harness(temp_home, monkeypatch)
-        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+    def test_baseline_fetches_active_plus_two_candidates(self, temp_home, monkeypatch):
+        # Four accounts so the ALTERNATE_POLLS_PER_TICK (2) baseline is a
+        # strict subset of the candidates, not the escalate-all set.
+        h = self._harness(temp_home, monkeypatch, accounts=4)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20), "4": _usage(30)}
         counts: dict[str, int] = {}
-        # t0: active (never fetched) + the stalest candidate.
+        # t0: active (never fetched) + the two most due candidates.
         self._tick(h, counts, usage)
-        assert counts == {"1": 1, "2": 1}
+        assert counts == {"1": 1, "2": 1, "3": 1}
         # t60: active planned MIN_INTERVAL_S out; the never-fetched candidate
         # is the due one.
         h.clock.advance(60)
         self._tick(h, counts, usage)
-        assert counts == {"1": 1, "2": 1, "3": 1}
+        assert counts == {"1": 1, "2": 1, "3": 1, "4": 1}
         # t120: nobody due — everyone served from the store.
         h.clock.advance(60)
         self._tick(h, counts, usage)
-        assert counts == {"1": 1, "2": 1, "3": 1}
+        assert counts == {"1": 1, "2": 1, "3": 1, "4": 1}
         # t180: the active account's plan comes due.
         h.clock.advance(60)
         self._tick(h, counts, usage)
-        assert counts == {"1": 2, "2": 1, "3": 1}
+        assert counts == {"1": 2, "2": 1, "3": 1, "4": 1}
 
     def test_near_threshold_escalates_to_full_refresh(self, temp_home, monkeypatch):
         # threshold 90, margin 15 → active at 80% is within the escalation band.
@@ -932,8 +933,10 @@ class TestAdaptiveScheduler:
         # Retry-After). Its last-good data ages past STALE_OK_S, but the
         # staleness is deliberate: headroom stays known, so no unhealthy
         # ticks and no escalate-all burst while the server is rate limiting.
-        h = self._harness(temp_home, monkeypatch)
-        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        # Four accounts: with three candidates due, the two-alternate baseline
+        # fetches two and an escalate-all burst would fetch three.
+        h = self._harness(temp_home, monkeypatch, accounts=4)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20), "4": _usage(30)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         h.clock.advance(60)
@@ -948,7 +951,7 @@ class TestAdaptiveScheduler:
         assert outcome is TickOutcome.NO_ACTION
         assert h.engine._unhealthy_ticks == 0
         assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        assert sum(counts.values()) == 2  # baseline slots only, no escalate-all
 
     def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
         self, temp_home, monkeypatch
@@ -1623,13 +1626,16 @@ class TestAdaptiveScheduler:
         phase-2 escalation is reserved for ticks that would actually switch.
         The fetch-set spy also catches an accidental all-candidates request
         that reserve() would have served from the store without HTTP."""
-        h = self._harness(temp_home, monkeypatch, strategy="consume-first")
+        # Four accounts so the two-alternate baseline never equals the
+        # all-candidates set the spy is watching for.
+        h = self._harness(temp_home, monkeypatch, accounts=4, strategy="consume-first")
         # Active resets soonest -> every tick holds already-consuming-soonest.
         # five_hour 50 mirrors the baseline-cadence test's active plan.
         usage = {
             "1": _usage7(50, 20, _R_SOON),
             "2": _usage7(10, 10, _R_LATER),
             "3": _usage7(10, 10, _R_LATEST),
+            "4": _usage7(10, 10, _R_LATEST),
         }
         counts: dict[str, int] = {}
         fetch_sets: list[set] = []
@@ -1647,9 +1653,9 @@ class TestAdaptiveScheduler:
                 assert outcome is TickOutcome.NO_ACTION
                 h.clock.advance(60)
         # (a) HTTP volume identical to the baseline cadence under `best`.
-        assert counts == {"1": 2, "2": 1, "3": 1}
+        assert counts == {"1": 2, "2": 1, "3": 1, "4": 1}
         # (b) no collection ever requested the all-candidates escalation set.
-        assert {"1", "2", "3"} not in fetch_sets
+        assert {"1", "2", "3", "4"} not in fetch_sets
 
     def test_consume_first_stale_target_holds_then_switches(
         self, temp_home, monkeypatch

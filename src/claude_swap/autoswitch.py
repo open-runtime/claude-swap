@@ -53,7 +53,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import due_candidates, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -2104,9 +2104,13 @@ class AutoSwitchEngine:
         ):
             plan.add(current)
         if self._idle_hold_since is None:
-            pick = due_candidate(candidates, pre, now)
-            if pick is not None:
-                plan.add(pick)
+            # Rows whose window reset after they were read go first (see
+            # due_candidates); the rest stalest first, up to the per-tick budget.
+            plan.update(
+                due_candidates(candidates, pre, now)[
+                    : poll_policy.ALTERNATE_POLLS_PER_TICK
+                ]
+            )
         entries = self.switcher.usage_entries_by_account(
             fetch=plan,
             # A candidate-style plan on the active slot is deliberately

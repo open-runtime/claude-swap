@@ -64,6 +64,8 @@ PAGE = """<!DOCTYPE html>
   .bar > span { display: block; height: 100%; background: var(--ok); }
   .bar.high > span { background: var(--warn); }
   .bar.full > span { background: var(--bad); }
+  .bar.pending { background: transparent; border: 1px dashed var(--line); box-sizing: border-box; }
+  .bar.pending > span { width: 0; }
   svg.chart { width: 100%; height: 220px; background: var(--panel); border-radius: 10px; display: block; }
   .legend { display: flex; gap: 16px; margin: 8px 0 0; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
   .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; background: var(--c); }
@@ -147,6 +149,21 @@ const SORTS = [
 let sortKey = localStorage.getItem("cswap.sort") || "slot";
 const pct = (w) => (w && w.pct != null) ? w.pct : null;
 const resetMs = (w) => (w && w.resetsAt) ? Date.parse(w.resetsAt) : null;
+// A reading taken before its own window's published reset describes a window
+// that no longer exists: 94% read at 1:48 for a window that reset at 1:50 is
+// 0% now. Settle such windows before anything renders, so room, sorting and
+// the next-available cards treat them as reset, and the table says the row is
+// waiting on a fresh read instead of showing the old bar next to "in now".
+const settleResets = (a) => {
+  for (const key of ["session", "weekly", "fable"]) {
+    const w = a[key];
+    const at = resetMs(w);
+    if (w && at != null && a.readAt != null && a.readAt * 1000 < at && at <= Date.now()) {
+      a[key] = { pct: 0, resetsAt: null, resetAt: w.resetsAt, awaitingRead: true };
+    }
+  }
+  return a;
+};
 // Room for the shared windows Opus draws from: session and weekly. 0 when either is full.
 const opusRoom = (a) => {
   const s = pct(a.session), w = pct(a.weekly);
@@ -320,7 +337,11 @@ function renderHero(state) {
   const active = state.accounts.find(a => a.active);
   const box = document.getElementById("hero");
   if (!active) { box.innerHTML = `<div class="card"><div class="label">Current account</div><div class="value">none</div></div>`; return; }
-  const w = (win, label) => win ? `<div class="card"><div class="label">${label}</div><div class="value">${Math.round(pct(win))}% used</div><div class="sub nowrap">resets ${clock(win.resetsAt)}</div></div>` : `<div class="card"><div class="label">${label}</div><div class="value small">not on this plan</div></div>`;
+  const w = (win, label) => !win
+    ? `<div class="card"><div class="label">${label}</div><div class="value small">not on this plan</div></div>`
+    : win.awaitingRead
+      ? `<div class="card"><div class="label">${label}</div><div class="value small">reset ${clock(win.resetAt)}</div><div class="sub nowrap">awaiting a fresh read</div></div>`
+      : `<div class="card"><div class="label">${label}</div><div class="value">${Math.round(pct(win))}% used</div><div class="sub nowrap">resets ${clock(win.resetsAt)}</div></div>`;
   box.innerHTML = `<div class="card ready"><div class="label">Current account</div><div class="value">${esc(who(active))}</div><div class="sub">${esc(active.tierLabel || "plan unknown")} · Fable ${minutesFor(active, "fable") != null ? minutesText(minutesFor(active, "fable")) : (fableRoom(active) > 0 ? Math.round(fableRoom(active)) + "%" : "full")} · Opus ${minutesFor(active, "opus") != null ? minutesText(minutesFor(active, "opus")) : (opusRoom(active) > 0 ? Math.round(opusRoom(active)) + "%" : "full")} left at your pace</div></div>` +
     w(active.session, "Session") + w(active.weekly, "Weekly") + w(active.fable, "Fable week");
 }
@@ -364,6 +385,7 @@ function renderPlans(plans) {
 }
 
 function render(state) {
+  state.accounts.forEach(settleResets);
   const tokensNow = state.tokens;
   document.getElementById("subtitle").textContent =
     `Strategy ${state.strategy || "—"} · model ${state.model || "session and weekly only"} · tokens from ${tokensNow.files} session logs, rescanned ${age(tokensNow.ageSeconds)}.`;
@@ -505,6 +527,7 @@ function renderAccounts(accounts, tokensNow) {
   };
   const windowCell = (w, model, a) => {
     if (!w) return `<span class="muted">${model === "fable" ? "not on this plan" : "—"}</span>`;
+    if (w.awaitingRead) return `<span class="bar pending"><span></span></span><span class="muted">reset</span><div class="muted nowrap">${clock(w.resetAt)} · awaiting a fresh read</div>`;
     const refused = model === "fable" && a && fableRefused(a)
       ? `<div class="pill bad" title="Claude Code's log shows the API refused Fable on this organization and asked for usage credits. Treated as no Fable room for an hour.">refused ${age(Date.now() / 1000 - a.fableRefusedAt)}</div>`
       : "";
@@ -534,7 +557,12 @@ function renderRoom(accounts, lookback) {
     rows.map(({ a, key, w }) => {
       const first = lastAccount !== a.number; lastAccount = a.number;
       const name = first ? `<div class="nowrap">${esc(who(a))}</div><div class="muted">${esc(a.tierLabel || "plan unknown")}</div>` : "";
-      return `<tr class="${a.active ? "active" : ""}"><td class="who">${name}</td><td>${label(key)}</td><td class="num">${w.usedPct != null ? Math.round(w.usedPct) + "%" : "—"}</td><td class="num nowrap">${w.burnPctPerHour != null ? w.burnPctPerHour.toFixed(1) + "% / h" : "—"}</td><td class="num nowrap">${w.tokensPerPoint != null ? fmt(w.tokensPerPoint) : "—"}${source(w)}</td><td class="num">${w.tokensLeft != null ? fmt(w.tokensLeft) : "—"}</td><td class="num nowrap">${minutesText(w.minutesLeft)}</td><td class="muted nowrap">${w.pointsRisen ? `${Math.round(w.pointsRisen)} points · ${fmt(w.tokensSpent)} tokens` : "no climb in the lookback"}</td></tr>`;
+      // Used, tokens left and time left are measured against the stored reading;
+      // once its window has rolled over they describe a window that is gone.
+      const settled = a[{ h5: "session", d7: "weekly", fable: "fable" }[key]];
+      const pending = settled && settled.awaitingRead;
+      const used = pending ? `<span class="muted">reset ${clock(settled.resetAt)}</span>` : w.usedPct != null ? Math.round(w.usedPct) + "%" : "—";
+      return `<tr class="${a.active ? "active" : ""}"><td class="who">${name}</td><td>${label(key)}</td><td class="num nowrap">${used}</td><td class="num nowrap">${w.burnPctPerHour != null ? w.burnPctPerHour.toFixed(1) + "% / h" : "—"}</td><td class="num nowrap">${w.tokensPerPoint != null ? fmt(w.tokensPerPoint) : "—"}${source(w)}</td><td class="num">${!pending && w.tokensLeft != null ? fmt(w.tokensLeft) : "—"}</td><td class="num nowrap">${pending ? "—" : minutesText(w.minutesLeft)}</td><td class="muted nowrap">${w.pointsRisen ? `${Math.round(w.pointsRisen)} points · ${fmt(w.tokensSpent)} tokens` : "no climb in the lookback"}</td></tr>`;
     }).join("");
 }
 async function tick() {
@@ -741,6 +769,7 @@ def read_state(
                 if number != account.number
             ],
             "readingAgeSeconds": account.usage.age_s,
+            "readAt": account.usage.fetched_at,
             "lastError": account.usage.last_error,
             "pollIntervalSeconds": account.usage.poll_interval_s,
             "consecutiveFailures": account.usage.consecutive_failures,

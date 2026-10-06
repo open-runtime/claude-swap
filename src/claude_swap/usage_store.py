@@ -437,10 +437,29 @@ def plan_oversleeps_interval(entry: UsageEntry, now: float) -> bool:
     )
 
 
-def due_candidate(
+def reset_passed_since_read(entry: UsageEntry, now: float) -> bool:
+    """Whether a window in ``entry.last_good`` rolled over after it was read.
+
+    A reading taken before its own window's published reset describes a
+    window that no longer exists: the session that read 94% at 1:48 is 0%
+    at 1:50. That row is wrong, not merely stale, and it hides a landing
+    candidate from the forecast, so the scheduler refetches it ahead of
+    every plain-staleness plan. Scoped windows count too; a Fable week
+    rolling over is exactly the moment a Fable landing opens up.
+    """
+    if entry.fetched_at is None or not isinstance(entry.last_good, dict):
+        return False
+    for _, _, resets_at in oauth.relevant_windows(entry.last_good, ("all",)):
+        stamp = parse_reset_ts(resets_at)
+        if stamp is not None and entry.fetched_at < stamp <= now:
+            return True
+    return False
+
+
+def due_candidates(
     candidates: list[str], entries: dict[str, UsageEntry], now: float
-) -> str | None:
-    """The due candidate with the stalest data, or None.
+) -> list[str]:
+    """Every due candidate, most urgent first.
 
     Due = past its ``nextPollAt``, not in failure backoff and not held for
     another machine's reading (``UsageStore.adopt``). Sentinel
@@ -448,11 +467,15 @@ def due_candidate(
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
-    Shared by the auto engine and the TUI watch view so both pick the same
-    single alternate to poll per pass. Poll plans
-    (``nextPollAt``/``pollIntervalS``) are written by whichever collector
-    fetched (see the plan persistence in ``_collect_usage_entries``), so
-    every surface inherits the same adaptive cadence.
+    Order: rows never read, then rows whose window reset after they were
+    read (``reset_passed_since_read``; these skip the ``nextPollAt`` gate,
+    because the plan was made for a window that has since rolled over),
+    then everything else stalest first.
+
+    Poll plans (``nextPollAt``/``pollIntervalS``) are written by whichever
+    collector fetched (see the plan persistence in
+    ``_collect_usage_entries``), so every surface inherits the same
+    adaptive cadence.
     """
     due: list[tuple[int, float, str]] = []
     for num in candidates:
@@ -468,20 +491,35 @@ def due_candidate(
             continue
         if entry.held(now):
             continue
+        rolled_over = reset_passed_since_read(entry, now)
         if (
-            entry.next_poll_at is not None
+            not rolled_over
+            and entry.next_poll_at is not None
             and now < entry.next_poll_at
             and not plan_oversleeps_interval(entry, now)
         ):
             continue
         if entry.fetched_at is None:
             due.append((0, 0.0, num))
-        else:
+        elif rolled_over:
             due.append((1, entry.fetched_at, num))
-    if not due:
-        return None
+        else:
+            due.append((2, entry.fetched_at, num))
     due.sort()
-    return due[0][2]
+    return [num for _, _, num in due]
+
+
+def due_candidate(
+    candidates: list[str], entries: dict[str, UsageEntry], now: float
+) -> str | None:
+    """The single most urgent due candidate, or None.
+
+    The TUI watch view polls one alternate per pass; the auto engine takes
+    the first ``poll_policy.ALTERNATE_POLLS_PER_TICK`` of
+    ``due_candidates`` so both agree on who goes first.
+    """
+    ranked = due_candidates(candidates, entries, now)
+    return ranked[0] if ranked else None
 
 
 def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> float | None:

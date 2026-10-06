@@ -19,6 +19,8 @@ from claude_swap.usage_store import (
     UsageEntry,
     UsageStore,
     due_candidate,
+    due_candidates,
+    reset_passed_since_read,
     with_sentinel,
 )
 
@@ -1240,6 +1242,91 @@ class TestDueCandidate:
 
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
+
+    @staticmethod
+    def _iso(epoch: float) -> str:
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+    def test_reset_passed_since_read_needs_read_before_reset_before_now(self):
+        reset = self.NOW - 60
+        read_before = UsageEntry(
+            last_good={"five_hour": {"pct": 94.0, "resets_at": self._iso(reset)}},
+            fetched_at=reset - 120,
+        )
+        read_after = UsageEntry(
+            last_good={"five_hour": {"pct": 0.0, "resets_at": self._iso(reset)}},
+            fetched_at=reset + 5,
+        )
+        future = UsageEntry(
+            last_good={"five_hour": {"pct": 94.0, "resets_at": self._iso(self.NOW + 60)}},
+            fetched_at=self.NOW - 120,
+        )
+        assert reset_passed_since_read(read_before, self.NOW)
+        assert not reset_passed_since_read(read_after, self.NOW)
+        assert not reset_passed_since_read(future, self.NOW)
+        assert not reset_passed_since_read(UsageEntry(), self.NOW)
+
+    def test_scoped_window_rollover_counts(self):
+        reset = self.NOW - 60
+        entry = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 10.0, "resets_at": self._iso(self.NOW + 3600)},
+                "seven_day": {"pct": 10.0, "resets_at": self._iso(self.NOW + 3600)},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": self._iso(reset)}],
+            },
+            fetched_at=reset - 120,
+        )
+        assert reset_passed_since_read(entry, self.NOW)
+
+    def test_rolled_over_row_is_due_despite_a_future_plan(self):
+        # The row that sat at 94% for 12 minutes after its 1:50 reset: a
+        # plan written for the old window must not gate the refetch.
+        reset = self.NOW - 60
+        entries = {
+            "2": UsageEntry(
+                last_good={"five_hour": {"pct": 94.0, "resets_at": self._iso(reset)}},
+                fetched_at=reset - 120,
+                age_s=180.0,
+                next_poll_at=self.NOW + 300,
+                poll_interval_s=600.0,
+            )
+        }
+        assert due_candidate(["2"], entries, self.NOW) == "2"
+
+    def test_rolled_over_row_beats_a_staler_plain_row(self):
+        reset = self.NOW - 60
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 900, age_s=900.0),
+            "3": UsageEntry(
+                last_good={"five_hour": {"pct": 94.0, "resets_at": self._iso(reset)}},
+                fetched_at=reset - 120,
+                age_s=180.0,
+            ),
+        }
+        assert due_candidates(["2", "3"], entries, self.NOW) == ["3", "2"]
+
+    def test_never_read_still_outranks_rolled_over(self):
+        reset = self.NOW - 60
+        entries = {
+            "2": UsageEntry(),
+            "3": UsageEntry(
+                last_good={"five_hour": {"pct": 94.0, "resets_at": self._iso(reset)}},
+                fetched_at=reset - 120,
+                age_s=180.0,
+            ),
+        }
+        assert due_candidates(["2", "3"], entries, self.NOW) == ["2", "3"]
+
+    def test_due_candidates_lists_every_due_row_stalest_first(self):
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 60, age_s=60.0),
+            "3": UsageEntry(fetched_at=self.NOW - 300, age_s=300.0),
+            "4": UsageEntry(fetched_at=self.NOW - 100, next_poll_at=self.NOW + 60),
+        }
+        assert due_candidates(["2", "3", "4"], entries, self.NOW) == ["3", "2"]
+        assert due_candidates([], {}, self.NOW) == []
 
 
 class TestDeadTokenQuarantine:
