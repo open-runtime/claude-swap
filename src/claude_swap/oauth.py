@@ -485,21 +485,26 @@ def build_usage_result(data: dict) -> dict | None:
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):
-        # Claude Code returns nullable used_credits, monthly_limit, and utilization
-        # (monthly_limit=None = unlimited). All three are needed to render the spend
-        # line, so when any is null skip just the spend entry; five_hour/seven_day
-        # go through unchanged.
+        # used_credits, monthly_limit and utilization are all nullable;
+        # monthly_limit=None means no cap, and utilization is null with it.
+        # Team seats with extra usage on and no cap are exactly the ones
+        # that bill when a window fills (a seat ran $1,547 of credits in
+        # five hours on Oct 6 while this entry was being dropped for its null
+        # cap), so the spend entry needs only ``used``; ``limit`` and ``pct``
+        # ride along when the plan has a cap.
         used_credits = eu.get("used_credits")
-        monthly_limit = eu.get("monthly_limit")
-        utilization = eu.get("utilization")
-        if used_credits is not None and monthly_limit is not None and utilization is not None:
+        if used_credits is not None:
             try:
                 spend_entry: dict = {
                     "used": float(used_credits) / 100,
-                    "limit": float(monthly_limit) / 100,
-                    "pct": float(utilization),
                     "currency": eu.get("currency", "USD"),
                 }
+                monthly_limit = eu.get("monthly_limit")
+                utilization = eu.get("utilization")
+                if monthly_limit is not None:
+                    spend_entry["limit"] = float(monthly_limit) / 100
+                if utilization is not None:
+                    spend_entry["pct"] = float(utilization)
                 if eu.get("resets_at"):
                     spend_entry["resets_at"] = eu["resets_at"]
                     spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])

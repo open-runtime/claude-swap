@@ -17,7 +17,7 @@ from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 from claude_swap import allocation, forecast, tokens
-from claude_swap.settings import load_settings
+from claude_swap.settings import load_settings, load_spend_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 HOST = "127.0.0.1"
@@ -145,6 +145,7 @@ const SORTS = [
   ["any", "Any room"],
   ["soonest", "Unblocks soonest"],
   ["tokens", "Tokens"],
+  ["credits", "Credits"],
 ];
 let sortKey = localStorage.getItem("cswap.sort") || "slot";
 const pct = (w) => (w && w.pct != null) ? w.pct : null;
@@ -351,7 +352,20 @@ function renderHero(state) {
       ? `<div class="card"><div class="label">${label}</div><div class="value small">reset ${clock(win.resetAt)}</div><div class="sub nowrap">awaiting a fresh read</div></div>`
       : `<div class="card"><div class="label">${label}</div><div class="value">${Math.round(pct(win))}% used</div><div class="sub nowrap">resets ${clock(win.resetsAt)}</div></div>`;
   box.innerHTML = `<div class="card ready"><div class="label">Current account</div><div class="value">${esc(who(active))}</div><div class="sub">${esc(active.tierLabel || "plan unknown")} · Fable ${minutesFor(active, "fable") != null ? minutesText(minutesFor(active, "fable")) : (fableRoom(active) > 0 ? Math.round(fableRoom(active)) + "%" : "full")} · Opus ${minutesFor(active, "opus") != null ? minutesText(minutesFor(active, "opus")) : (opusRoom(active) > 0 ? Math.round(opusRoom(active)) + "%" : "full")} left at your pace</div></div>` +
-    w(active.session, "Session") + w(active.weekly, "Weekly") + w(active.fable, "Fable week");
+    w(active.session, "Session") + w(active.weekly, "Weekly") + w(active.fable, "Fable week") + creditsCard(state.credits, active);
+}
+// Usage credits bill the moment a seat with extra usage on fills a window;
+// the rotator treats them as the last resort, after every account's Fable
+// and then Opus room is gone. This card is the running total against the
+// monthly budget, and goes red while any seat is billing.
+const money = (n, currency) => n == null ? "—" : new Intl.NumberFormat(undefined, { style: "currency", currency: currency || "USD" }).format(n);
+function creditsCard(credits, active) {
+  if (!credits || !credits.seats) return "";
+  const billing = (credits.recent || 0) > 0;
+  const budget = credits.monthlyBudget;
+  const pct = budget ? Math.round(100 * credits.used / budget) : null;
+  const here = active && active.spend ? `This seat: ${money(active.spend.used, credits.currency)} this month` + ((active.spend.recent || 0) > 0 ? `, ${money(active.spend.recent, credits.currency)} in the selected window` : "") : "This seat does not bill credits";
+  return `<div class="card ${billing ? "none" : ""}"><div class="label">Usage credits, this month</div><div class="value">${money(credits.used, credits.currency)}${budget ? ` <span class="small muted">of ${money(budget, credits.currency)} · ${pct}%</span>` : ""}</div><div class="sub">${billing ? `Billing now: ${money(credits.recent, credits.currency)} in the selected window. ` : ""}${here}${budget ? "" : " · set spend.monthlyBudget to track a budget"}</div></div>`;
 }
 
 function renderResets(state) {
@@ -497,6 +511,7 @@ function sortAccounts(accounts) {
   else if (sortKey === "opus") rows.sort(desc(opusRoom));
   else if (sortKey === "any") rows.sort(desc(a => Math.max(fableRoom(a) ?? 0, opusRoom(a) ?? 0)));
   else if (sortKey === "tokens") rows.sort(desc(a => a.tokens ? a.tokens.total : 0));
+  else if (sortKey === "credits") rows.sort(desc(a => a.spend ? a.spend.used : -1));
   else if (sortKey === "soonest") rows.sort((a, b) => {
     // Open accounts first, then blocked ones by the reset that frees them. A
     // session reset does not help an account whose week is full.
@@ -516,6 +531,7 @@ function renderAccounts(accounts, tokensNow) {
     any: "Most room for either model first.",
     soonest: "Open accounts first, then blocked accounts by the reset that frees them.",
     tokens: "Most tokens in the selected lookback first.",
+    credits: "Most usage credits billed this month first. Only seats with extra usage on bill credits; the rotator uses them last.",
   }[sortKey];
   const roomPill = (a) => {
     const tag = (label, model) => {
@@ -544,9 +560,15 @@ function renderAccounts(accounts, tokensNow) {
       : "";
     return `${bar(pct(w))}<div class="muted nowrap">${resetCell(w)}</div>${hit}${refused}`;
   };
-  document.getElementById("accounts").innerHTML = `<tr><th>Account</th><th>Session</th><th>Weekly</th><th>Fable</th><th class="num">Tokens</th><th class="num">Calls</th><th>Read</th></tr>` +
-    sortAccounts(accounts).map(a => `<tr class="${a.active ? "active" : ""}"><td class="who"><div>${esc(who(a))}${a.active ? ' <span class="pill ok">active</span>' : ""}</div><div class="muted">${esc(a.tierLabel || "plan unknown")}</div><div>${roomPill(a)}</div></td><td>${windowCell(a.session)}</td><td>${windowCell(a.weekly)}</td><td>${windowCell(a.fable, "fable", a)}</td><td class="num">${fmt(a.tokens && a.tokens.total)}<div class="muted nowrap">${a.tokens ? fmt(a.tokens.output) + " out" : ""}</div><div>${sharedNote(a)}</div></td><td class="num">${fmt(a.tokens && a.tokens.calls)}</td><td class="muted nowrap">${age(a.readingAgeSeconds)}${a.lastError ? " · " + esc(a.lastError) : ""}</td></tr>`).join("") +
-    (tokensNow.unattributed && tokensNow.unattributed.calls ? `<tr><td class="muted">Sessions with no organization marker</td><td></td><td></td><td></td><td class="num">${fmt(tokensNow.unattributed.total)}</td><td class="num">${fmt(tokensNow.unattributed.calls)}</td><td></td></tr>` : "");
+  const creditsCell = (a) => {
+    if (!a.spend) return `<span class="muted">—</span>`;
+    const billing = (a.spend.recent || 0) > 0;
+    return `<div class="nowrap">${money(a.spend.used, a.spend.currency)}</div>` +
+      (billing ? `<div class="pill bad" title="This seat's billed total rose during the selected window: its plan windows were full and extra usage covered the requests.">billing now · ${money(a.spend.recent, a.spend.currency)}</div>` : `<div class="muted nowrap">extra usage on</div>`);
+  };
+  document.getElementById("accounts").innerHTML = `<tr><th>Account</th><th>Session</th><th>Weekly</th><th>Fable</th><th class="num">Credits</th><th class="num">Tokens</th><th class="num">Calls</th><th>Read</th></tr>` +
+    sortAccounts(accounts).map(a => `<tr class="${a.active ? "active" : ""}"><td class="who"><div>${esc(who(a))}${a.active ? ' <span class="pill ok">active</span>' : ""}</div><div class="muted">${esc(a.tierLabel || "plan unknown")}</div><div>${roomPill(a)}</div></td><td>${windowCell(a.session)}</td><td>${windowCell(a.weekly)}</td><td>${windowCell(a.fable, "fable", a)}</td><td class="num">${creditsCell(a)}</td><td class="num">${fmt(a.tokens && a.tokens.total)}<div class="muted nowrap">${a.tokens ? fmt(a.tokens.output) + " out" : ""}</div><div>${sharedNote(a)}</div></td><td class="num">${fmt(a.tokens && a.tokens.calls)}</td><td class="muted nowrap">${age(a.readingAgeSeconds)}${a.lastError ? " · " + esc(a.lastError) : ""}</td></tr>`).join("") +
+    (tokensNow.unattributed && tokensNow.unattributed.calls ? `<tr><td class="muted">Sessions with no organization marker</td><td></td><td></td><td></td><td></td><td class="num">${fmt(tokensNow.unattributed.total)}</td><td class="num">${fmt(tokensNow.unattributed.calls)}</td><td></td></tr>` : "");
 }
 
 // What one percent is worth on each account, measured over the selected lookback.
@@ -595,6 +617,27 @@ def _window(usage: dict | None, key: str) -> dict | None:
     if not isinstance(raw, dict) or not isinstance(raw.get("pct"), (int, float)):
         return None
     return {"pct": float(raw["pct"]), "resetsAt": raw.get("resets_at")}
+
+
+def _spend(
+    usage: dict | None,
+    history: list[allocation.Reading] | None,
+    number: str,
+    since: float,
+) -> dict | None:
+    """The seat's usage-credit spend, or None when extra usage is off."""
+    if not isinstance(usage, dict):
+        return None
+    raw = usage.get("spend")
+    if not isinstance(raw, dict) or not isinstance(raw.get("used"), (int, float)):
+        return None
+    recent = allocation.credits_billed_since(history, number, since) if history else None
+    return {
+        "used": float(raw["used"]),
+        "limit": float(raw["limit"]) if isinstance(raw.get("limit"), (int, float)) else None,
+        "currency": raw.get("currency") or "USD",
+        "recent": recent,
+    }
 
 
 def _fable(usage: dict | None) -> dict | None:
@@ -789,6 +832,9 @@ def read_state(
                 if (hit := latest_hit.get(account.org_uuid or "")) is not None
                 else None
             ),
+            # Usage credits: present only on seats with extra usage on.
+            # ``recent`` is what this seat billed inside the lookback.
+            "spend": _spend(usage, history, account.number, now - lookback_s),
             "tokens": organization_tokens,
             "tokensSharedWith": [
                 number for number in slots_by_organization.get(account.org_uuid or "", [])
@@ -886,6 +932,8 @@ def read_state(
             entry[key] = values[len(values) // 2]
             entry[key + "Accounts"] = len(values)
         plans.append(entry)
+    spend_settings = load_spend_settings(switcher.backup_dir)
+    billing_seats = [view for view in views if view["spend"] is not None]
     return {
         "strategy": settings.strategy,
         "model": settings.model,
@@ -893,6 +941,13 @@ def read_state(
         "active": snapshot.active_number,
         "decision": decision,
         "accounts": views,
+        "credits": {
+            "monthlyBudget": spend_settings.monthly_budget,
+            "used": round(sum(view["spend"]["used"] for view in billing_seats), 2),
+            "recent": round(sum(view["spend"]["recent"] or 0.0 for view in billing_seats), 2),
+            "seats": len(billing_seats),
+            "currency": next((view["spend"]["currency"] for view in billing_seats), "USD"),
+        },
         "samples": [
             {"at": sample.at, "session": sample.session_pct, "fable": sample.fable_pct}
             for sample in samples

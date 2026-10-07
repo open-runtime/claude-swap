@@ -893,6 +893,12 @@ def _history_line(now: float, num: str, identity: Identity, usage: dict | None) 
                     row.setdefault("scoped", {})[item["name"]] = float(item["pct"])
                     if item.get("resets_at"):
                         row.setdefault("scopedReset", {})[item["name"]] = item["resets_at"]
+        # Usage credits billed so far this month, in whole currency units.
+        # Present only when the seat has extra usage enabled, so a later
+        # reading that is higher means the seat was billing in between.
+        spend = usage.get("spend")
+        if isinstance(spend, dict) and isinstance(spend.get("used"), (int, float)):
+            row["spend"] = round(float(spend["used"]), 2)
     return json.dumps(row, separators=(",", ":"))
 
 

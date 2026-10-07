@@ -2278,17 +2278,48 @@ class AutoSwitchEngine:
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
 
+    def _note_credit_spend(self, number: str, samples: list[forecast.Sample]) -> None:
+        """Log once per reading that found the active seat billing credits.
+
+        The percentages stop at 100, so this line is the only place the
+        rotator says money is moving. ``_should_leave`` acts on the same
+        figure; this just makes sure it is in the log.
+        """
+        billed = forecast.credits_billed(samples)
+        if billed is None or billed <= 0.0:
+            return
+        latest = samples[-1]
+        key = (str(number), latest.at)
+        announced = getattr(self, "_credit_spend_announced", set())
+        if key in announced:
+            return
+        announced.add(key)
+        self._credit_spend_announced = announced
+        _logger.warning(
+            "Account-%s billed $%.2f of usage credits since the last reading ($%.2f this month); "
+            "its plan windows are full",
+            number,
+            billed,
+            latest.spend_used or 0.0,
+        )
+
     def _remember_forecast_sample(self, number: str, usage: dict | str | None) -> list[forecast.Sample]:
         account = forecast.snapshot(str(number), usage)
         session = account.five_hour.pct if account is not None and account.five_hour is not None else None
         now = self.clock()
+
+        spend = account.spend.used if account is not None and account.spend is not None else None
 
         def apply(existing: list) -> list[dict]:
             kept = [item for item in existing if isinstance(item, dict)]
             if session is None:
                 return kept
             fable = account.fable.pct if account is not None and account.fable is not None else None
-            return forecast.record_sample(kept, at=now, session_pct=session, fable_pct=fable)
+            rows = forecast.record_sample(
+                kept, at=now, session_pct=session, fable_pct=fable, spend_used=spend
+            )
+            self._note_credit_spend(number, forecast.samples_from(rows))
+            return rows
 
         if self.dry_run:
             rows = apply(getattr(self, "_forecast_memory", {}).get(str(number), []))

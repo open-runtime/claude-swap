@@ -116,10 +116,11 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["sevenDay"] = _weekly_window_to_json(usage["seven_day"], fetched_at)
     if "spend" in usage:
         spend = usage["spend"]
+        # limit and pct are absent on uncapped plans (monthly_limit null).
         spend_out: dict = {
             "used": spend["used"],
-            "limit": spend["limit"],
-            "pct": spend["pct"],
+            "limit": spend.get("limit"),
+            "pct": spend.get("pct"),
             "currency": spend["currency"],
         }
         if "resets_at" in spend:
@@ -181,11 +182,27 @@ def usage_from_json(usage: object) -> dict:
         out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
     if "spend" in usage:
         spend = usage["spend"]
-        out_spend = _window_from_json(spend, "spend")
-        for key in ("used", "limit"):
-            if not _is_number(spend.get(key)):
+        if not _is_number(spend.get("used")):
+            raise ValueError("spend.used must be a number")
+        # pct and limit are null on uncapped plans; _window_from_json
+        # requires pct, so build the entry by hand.
+        out_spend: dict = {"used": float(spend["used"])}
+        for key in ("limit", "pct"):
+            value = spend.get(key)
+            if value is None:
+                continue
+            if not _is_number(value):
                 raise ValueError(f"spend.{key} must be a number")
-            out_spend[key] = float(spend[key])
+            out_spend[key] = float(value)
+        resets_at = spend.get("resetsAt")
+        if resets_at is not None:
+            if not isinstance(resets_at, str):
+                raise ValueError("spend.resetsAt must be an ISO-8601 string")
+            try:
+                out_spend["countdown"], out_spend["clock"] = oauth.format_reset(resets_at)
+            except (ValueError, TypeError):
+                raise ValueError(f"spend.resetsAt is not an ISO-8601 time: {resets_at!r}")
+            out_spend["resets_at"] = resets_at
         if not isinstance(spend.get("currency"), str):
             raise ValueError("spend.currency must be a string")
         out_spend["currency"] = spend["currency"]

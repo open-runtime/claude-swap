@@ -119,6 +119,29 @@ def test_history_rows_become_readings():
     rows = [{"at": 1.0, "slot": "5", "org": "org-a", "h5": 12.0, "d7": 50.0, "scoped": {"Fable": 76.0}}]
     readings = readings_from_history(rows)
     assert readings[0].pct == {"h5": 12.0, "d7": 50.0, "fable": 76.0}
+    assert readings[0].spend is None
+
+
+def test_history_rows_carry_spend_and_the_billed_delta_is_measured():
+    from claude_swap.allocation import credits_billed_since
+
+    rows = [
+        {"at": NOW - 3600, "slot": "13", "org": "org-p", "h5": 100.0, "spend": 1200.0},
+        {"at": NOW - 1800, "slot": "13", "org": "org-p", "h5": 100.0, "spend": 1400.5},
+        {"at": NOW - 60, "slot": "13", "org": "org-p", "h5": 100.0, "spend": 1547.27},
+        {"at": NOW - 60, "slot": "1", "org": "org-a", "h5": 50.0},
+    ]
+    readings = readings_from_history(rows)
+    assert readings[0].spend == 1200.0
+    assert credits_billed_since(readings, "13", NOW - 7200) == 347.27
+    assert credits_billed_since(readings, "13", NOW - 600) is None  # one figure in range
+    assert credits_billed_since(readings, "1", NOW - 7200) is None  # extra usage off
+    # A monthly rollover reads as zero, not a refund.
+    rolled = readings_from_history([
+        {"at": NOW - 120, "slot": "13", "org": "org-p", "h5": 1.0, "spend": 1547.27},
+        {"at": NOW - 60, "slot": "13", "org": "org-p", "h5": 1.0, "spend": 0.0},
+    ])
+    assert credits_billed_since(rolled, "13", NOW - 7200) == 0.0
 
 
 def test_auto_log_backfill_infers_dates_walking_backwards(tmp_path: Path):

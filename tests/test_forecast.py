@@ -7,19 +7,30 @@ from claude_swap.forecast import (
     QUIET_CEILING_PCT,
     AccountSnapshot,
     Sample,
+    Spend,
     Window,
+    credits_billed,
     decide,
     record_sample,
+    samples_from,
     session_burn,
+    snapshot,
 )
 
 
-def _account(number: str, session: float, weekly: float = 0.0, fable: float | None = None) -> AccountSnapshot:
+def _account(
+    number: str,
+    session: float,
+    weekly: float = 0.0,
+    fable: float | None = None,
+    spend: float | None = None,
+) -> AccountSnapshot:
     return AccountSnapshot(
         number=number,
         five_hour=Window(session),
         seven_day=Window(weekly),
         fable=None if fable is None else Window(fable),
+        spend=None if spend is None else Spend(spend),
     )
 
 
@@ -219,4 +230,71 @@ class TestForecastPolicy:
             row = record_sample(row, at=120 + index * 60, session_pct=20 + index)
         assert len(row) == 8
         assert row[-1]["pct"] == 29
+
+
+class TestUsageCredits:
+    """Seat 13 on Oct 6: five hours at 100% with extra usage on, $1,547 of
+    credits, no limit message anywhere. Credits are the last resort, used
+    only when every other account is out of plan room."""
+
+    def test_snapshot_reads_spend_only_when_extra_usage_is_on(self):
+        with_credits = snapshot("13", {"five_hour": {"pct": 100}, "seven_day": {"pct": 86}, "spend": {"used": 1547.27, "currency": "USD"}})
+        without = snapshot("1", {"five_hour": {"pct": 50}, "seven_day": {"pct": 10}})
+        assert with_credits.spend == Spend(used=1547.27)
+        assert without.spend is None
+
+    def test_record_sample_keeps_spend_and_a_spend_change_is_a_new_sample(self):
+        row = record_sample([], at=0, session_pct=100, spend_used=10.0)
+        # Same percentages seconds later, but the bill moved: that is news.
+        row = record_sample(row, at=20, session_pct=100, spend_used=12.5)
+        assert [item["spend"] for item in row] == [10.0, 12.5]
+        samples = samples_from(row)
+        assert samples[-1].spend_used == 12.5
+        assert credits_billed(samples) == 2.5
+        assert credits_billed([Sample(0, 50), Sample(60, 55)]) is None
+
+    def test_billing_seat_leaves_for_any_account_with_plan_room(self):
+        # The reading still says 97%, but the bill rose between readings:
+        # the seat is past its plan. Slot 2 has Opus room only; take it.
+        decision = _decide(
+            [_account("13", 97, 86, fable=100, spend=1550.0), _account("2", 40, 74, fable=100)],
+            [Sample(0, 97, 100, 1547.27), Sample(120, 97, 100, 1550.0)],
+            current="13",
+        )
+        assert decision.switch_to == "2"
+        assert decision.escaping_limit is True
+        assert "billing usage credits" in decision.detail
+
+    def test_billing_seat_prefers_fable_room_over_opus_room(self):
+        decision = _decide(
+            [
+                _account("13", 97, 86, fable=100, spend=1550.0),
+                _account("2", 40, 74, fable=100),
+                _account("17", 25, 34, fable=13),
+            ],
+            [Sample(0, 97, 100, 1547.27), Sample(120, 97, 100, 1550.0)],
+            current="13",
+        )
+        assert decision.switch_to == "17"
+        assert "most Fable room" in decision.detail
+
+    def test_billing_seat_stays_when_every_other_account_is_exhausted(self):
+        decision = _decide(
+            [_account("13", 97, 86, fable=100, spend=1550.0), _account("2", 100, 74), _account("4", 10, 100)],
+            [Sample(0, 97, 100, 1547.27), Sample(120, 97, 100, 1550.0)],
+            current="13",
+        )
+        assert decision.switch_to is None
+        assert decision.reason == "credits-backstop"
+        assert "usage credits are carrying the work" in decision.detail
+
+    def test_a_flat_bill_is_not_a_reason_to_leave(self):
+        decision = _decide(
+            [_account("13", 50, 40, fable=20, spend=1547.27), _account("2", 0, 0, fable=0)],
+            [Sample(0, 50, 20, 1547.27), Sample(120, 50, 20, 1547.27)],
+            current="13",
+        )
+        assert decision.switch_to is None
+        assert decision.reason == "holding"
+        assert "$1,547.27 of usage credits this month" in decision.detail
 

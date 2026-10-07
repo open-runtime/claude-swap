@@ -40,6 +40,9 @@ class Reading:
     pct: dict[str, float]
     # Reset time the provider published for each window at this reading.
     scheduled: dict[str, str] = field(default_factory=dict)
+    # Usage credits billed so far this month, when the seat has extra usage
+    # on. Two readings that differ bracket an interval the seat was billing.
+    spend: float | None = None
 
 
 @dataclass
@@ -124,9 +127,28 @@ def readings_from_history(rows: list[dict]) -> list[Reading]:
                         scheduled["fable"] = scoped_reset[name]
         if not pct:
             continue
-        out.append(Reading(at=float(row["at"]), slot=str(row.get("slot", "")), organization=str(row.get("org", "")), pct=pct, scheduled=scheduled))
+        spend = row.get("spend")
+        out.append(Reading(
+            at=float(row["at"]), slot=str(row.get("slot", "")), organization=str(row.get("org", "")),
+            pct=pct, scheduled=scheduled,
+            spend=float(spend) if isinstance(spend, (int, float)) and not isinstance(spend, bool) else None,
+        ))
     out.sort(key=lambda reading: reading.at)
     return out
+
+
+def credits_billed_since(readings: list[Reading], slot: str, since: float) -> float | None:
+    """Credits a seat billed across its readings after ``since``.
+
+    The difference between the first and last spend figures the seat
+    reported in the window; None when it reported fewer than two. A
+    monthly rollover (spend dropping) is clamped to zero rather than
+    reported as a refund.
+    """
+    figures = [r.spend for r in readings if r.slot == slot and r.at >= since and r.spend is not None]
+    if len(figures) < 2:
+        return None
+    return max(0.0, figures[-1] - figures[0])
 
 
 _POLL_LINE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\s+Account-(\d+) \([^)]*\): .*?\| others: (.*)$")

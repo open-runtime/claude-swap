@@ -315,8 +315,9 @@ class TestFetchUsage:
         assert result["spend"]["pct"] == 14.58
         assert result["spend"]["currency"] == "USD"
 
-    def test_extra_usage_unlimited_keeps_other_rows(self):
-        """Unlimited (monthly_limit=None) drops the spend entry without losing five_hour/seven_day."""
+    def test_extra_usage_unlimited_reports_what_was_billed(self):
+        """Uncapped (monthly_limit=None): the seat still bills when a window
+        fills, so the dollars must come through; only limit and pct are absent."""
         result = self._fetch_with_response({
             "five_hour": {"utilization": 22.0, "resets_at": None},
             "seven_day": {"utilization": 61.0, "resets_at": None},
@@ -331,7 +332,7 @@ class TestFetchUsage:
         assert result is not None
         assert result["five_hour"]["pct"] == 22.0
         assert result["seven_day"]["pct"] == 61.0
-        assert "spend" not in result
+        assert result["spend"] == {"used": 729.0, "currency": "USD"}
 
     def test_extra_usage_partial_keeps_other_rows(self):
         """A null in used_credits leaves the rest of the response untouched."""

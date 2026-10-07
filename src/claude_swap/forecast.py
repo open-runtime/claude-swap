@@ -40,11 +40,26 @@ class Window:
 
 
 @dataclass(frozen=True)
+class Spend:
+    """Usage credits billed so far this month, on a seat with extra usage on.
+
+    Such a seat is never refused: when a window fills the API keeps serving
+    and bills credits instead. Seat 13 did that for five hours on Oct 6,
+    $1,547 of it, with no limit message anywhere. Credits are an acceptable
+    backstop when every account is exhausted, and the wrong place to sit
+    while another account still has plan room.
+    """
+
+    used: float
+
+
+@dataclass(frozen=True)
 class AccountSnapshot:
     number: str
     five_hour: Window | None
     seven_day: Window | None
     fable: Window | None
+    spend: Spend | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +67,7 @@ class Sample:
     at: float
     session_pct: float
     fable_pct: float | None = None
+    spend_used: float | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +108,15 @@ def fable_window(usage: dict | str | None) -> Window | None:
     return None
 
 
+def spend_from(usage: dict | str | None) -> Spend | None:
+    if not isinstance(usage, dict):
+        return None
+    raw = usage.get("spend")
+    if not isinstance(raw, dict) or not isinstance(raw.get("used"), (int, float)):
+        return None
+    return Spend(used=float(raw["used"]))
+
+
 def snapshot(number: str, usage: dict | str | None) -> AccountSnapshot | None:
     if not isinstance(usage, dict):
         return None
@@ -100,6 +125,7 @@ def snapshot(number: str, usage: dict | str | None) -> AccountSnapshot | None:
         five_hour=window_from(usage, "five_hour"),
         seven_day=window_from(usage, "seven_day"),
         fable=fable_window(usage),
+        spend=spend_from(usage),
     )
     if account.five_hour is None and account.seven_day is None and account.fable is None:
         return None
@@ -112,6 +138,7 @@ def record_sample(
     at: float,
     session_pct: float,
     fable_pct: float | None = None,
+    spend_used: float | None = None,
 ) -> list[dict]:
     """Append one reading, dropping duplicates and keeping the tail."""
     row: list[dict] = []
@@ -124,6 +151,8 @@ def record_sample(
             kept = {"at": float(item["at"]), "pct": float(item["pct"])}
             if isinstance(item.get("fable"), (int, float)):
                 kept["fable"] = float(item["fable"])
+            if isinstance(item.get("spend"), (int, float)):
+                kept["spend"] = float(item["spend"])
             row.append(kept)
     if row and at <= row[-1]["at"]:
         return row[-MAX_SAMPLES:]
@@ -133,16 +162,25 @@ def record_sample(
         or not isinstance(last_fable, float)
         or abs(last_fable - fable_pct) < 0.05
     )
+    last_spend = row[-1].get("spend") if row else None
+    spend_unchanged = (
+        spend_used is None
+        or not isinstance(last_spend, float)
+        or abs(last_spend - spend_used) < 0.005
+    )
     if (
         row
         and abs(row[-1]["pct"] - session_pct) < 0.05
         and fable_unchanged
+        and spend_unchanged
         and at - row[-1]["at"] < MIN_SAMPLE_SPAN_S
     ):
         return row[-MAX_SAMPLES:]
     stored = {"at": at, "pct": session_pct}
     if fable_pct is not None:
         stored["fable"] = fable_pct
+    if spend_used is not None:
+        stored["spend"] = spend_used
     row.append(stored)
     return row[-MAX_SAMPLES:]
 
@@ -157,11 +195,13 @@ def samples_from(raw: list) -> list[Sample]:
         ):
             continue
         fable = item.get("fable")
+        spend = item.get("spend")
         samples.append(
             Sample(
                 at=float(item["at"]),
                 session_pct=float(item["pct"]),
                 fable_pct=float(fable) if isinstance(fable, (int, float)) else None,
+                spend_used=float(spend) if isinstance(spend, (int, float)) else None,
             )
         )
     return samples
@@ -255,6 +295,20 @@ def _headroom(account: AccountSnapshot, *, fable: bool) -> float:
     return 100.0 - max(pcts)
 
 
+def credits_billed(samples: list[Sample]) -> float | None:
+    """Credits billed between the last two readings that carried a spend
+    figure, or None when there are not two such readings.
+
+    Positive means the seat was billing in that interval: its plan windows
+    are full and extra usage is covering the requests. Nothing else in the
+    usage reading says so, since the percentages stop at 100.
+    """
+    with_spend = [sample for sample in samples if sample.spend_used is not None]
+    if len(with_spend) < 2:
+        return None
+    return with_spend[-1].spend_used - with_spend[-2].spend_used
+
+
 def _should_leave(
     active: AccountSnapshot, samples: list[Sample], *, prefer_fable: bool
 ) -> tuple[bool, bool, str]:
@@ -263,12 +317,20 @@ def _should_leave(
     The reason starts with ``fable`` when Fable is the only window forcing the
     move. A full Fable week used to be ignored while the session still had
     hours left, which is how slot 6 sat at Fable 100% and session 17%.
+
+    ``credit-spend`` is a hard limit too: the seat is past its plan and
+    billing usage credits. Credits are the last resort, so any account with
+    plan room is a better place to be; ``decide`` stays only when there is
+    none.
     """
     session = active.five_hour.pct if active.five_hour is not None else None
     weekly = active.seven_day.pct if active.seven_day is not None else None
     fable = active.fable.pct if prefer_fable and active.fable is not None else None
     if (session is not None and session >= 100.0) or (weekly is not None and weekly >= 100.0):
         return True, True, "session-limit"
+    billed = credits_billed(samples)
+    if active.spend is not None and billed is not None and billed > 0.0:
+        return True, True, "credit-spend"
     if (
         (session is not None and session >= QUIET_CEILING_PCT)
         or (weekly is not None and weekly >= QUIET_CEILING_PCT)
@@ -306,6 +368,12 @@ def _fill_phrase(active: AccountSnapshot, samples: list[Sample]) -> str:
         parts.append(_runway_phrase("session", active.five_hour.pct, session_burn(samples)))
     if active.fable is not None:
         parts.append(_runway_phrase("Fable", active.fable.pct, fable_burn(samples)))
+    if active.spend is not None:
+        billed = credits_billed(samples)
+        if billed is not None and billed > 0.0:
+            parts.append(f"billing usage credits (${billed:,.2f} since the last reading, ${active.spend.used:,.2f} this month)")
+        else:
+            parts.append(f"${active.spend.used:,.2f} of usage credits this month")
     return "; ".join(parts)
 
 
@@ -417,6 +485,19 @@ def decide(
         # Leaving a dead account: a short landing still beats no landing.
         peers = [account for account in others if _opus_usable(account)]
     if not peers:
+        if because == "credit-spend" and all(not _opus_usable(account) for account in others):
+            # Credits are the backstop: every other account is out of plan
+            # room, so staying here and paying is the only way to keep going.
+            return Decision(
+                switch_to=None,
+                reason="credits-backstop",
+                detail=(
+                    f"{_fill_phrase(active, samples)}; every other account is at a "
+                    "session or weekly limit, so usage credits are carrying the work"
+                ),
+                fable_available=False,
+                escaping_limit=True,
+            )
         if not _opus_usable(active) and all(not _opus_usable(account) for account in others):
             return Decision(
                 switch_to=None,

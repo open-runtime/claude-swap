@@ -127,7 +127,9 @@ def usage_rows(
         return []
     rows: list[tuple[str, float, str, str]] = []
     spend = last_good.get("spend")
-    if spend:
+    if spend and isinstance(spend.get("pct"), (int, float)) and spend.get("limit") is not None:
+        # Only a capped plan has a percentage to draw a bar for; an uncapped
+        # seat's dollar figure is shown by the list and dashboard instead.
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
         reset, reset_full = _reset_parts(spend, now)
         suffix = f"{reset}  {amounts}" if reset else amounts

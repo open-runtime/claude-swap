@@ -49,6 +49,17 @@ def store(tmp_path, clock):
     return UsageStore(tmp_path / "cache", clock=clock)
 
 
+class TestHistoryLine:
+    def test_spend_rides_along_when_extra_usage_is_on(self):
+        from claude_swap.usage_store import _history_line
+
+        usage = {**USAGE, "spend": {"used": 1547.274, "currency": "USD"}}
+        row = json.loads(_history_line(1_000_000.0, "13", ("a@x.com", "org-p"), usage))
+        assert row["spend"] == 1547.27
+        plain = json.loads(_history_line(1_000_000.0, "1", ("b@x.com", ""), USAGE))
+        assert "spend" not in plain
+
+
 class TestSchema:
     def test_empty_when_missing(self, store):
         entries = store.entries(IDENT)

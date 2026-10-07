@@ -67,7 +67,24 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class SpendSettings:
+    """Usage-credit preferences (``spend`` section).
+
+    ``monthly_budget`` is what the team is allowed to bill in extra usage per
+    month, in the plan's currency, summed over every seat. The dashboard
+    shows spend against it; nothing enforces it, since the API bills the
+    moment a seat with extra usage on fills a window. None = no budget set.
+    """
+
+    monthly_budget: float | None = None
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "spend": SpendSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -138,6 +155,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "spend", "monthlyBudget", "monthly_budget", "float", 0.0, 1e9,
+            help="Usage credits the team may bill per month, all seats together (dashboard only)",
         ),
     )
 }
@@ -229,6 +250,18 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
     except TypeError:
         settings = AutoSwitchSettings()
     return _clamped(settings)
+
+
+def load_spend_settings(backup_root: Path) -> SpendSettings:
+    """Load the spend section; missing/corrupt file or a non-number → None."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("spend")
+    if not isinstance(section, dict):
+        return SpendSettings()
+    budget = section.get("monthlyBudget")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget < 0:
+        return SpendSettings()
+    return SpendSettings(monthly_budget=float(budget))
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
@@ -412,6 +445,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "spend": load_spend_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

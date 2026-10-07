@@ -784,6 +784,16 @@ class TestUsageFromJson:
 
         assert usage_from_json({"fiveHour": {"pct": 3}}) == {"five_hour": {"pct": 3.0}}
 
+    def test_uncapped_spend_round_trips_without_limit_or_pct(self):
+        # A team seat with extra usage on and no monthly cap reports only
+        # what it has billed; limit and pct are null.
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {"spend": {"used": 1547.27, "currency": "USD"}}
+        out = usage_to_json(internal, fetched_at=None)
+        assert out["spend"] == {"used": 1547.27, "limit": None, "pct": None, "currency": "USD"}
+        assert usage_from_json(out) == internal
+
     @pytest.mark.parametrize("usage", [
         None,
         {},
@@ -792,7 +802,8 @@ class TestUsageFromJson:
         {"fiveHour": {"pct": float("nan")}},
         {"fiveHour": {"pct": True}},
         {"sevenDay": {"pct": 1, "resetsAt": "next tuesday"}},
-        {"spend": {"pct": 1, "used": 1, "currency": "USD"}},
+        {"spend": {"pct": 1, "used": "1", "currency": "USD"}},
+        {"spend": {"used": 1, "limit": "50", "currency": "USD"}},
         {"scoped": [{"pct": 1}]},
         {"scoped": {"name": "Fable", "pct": 1}},
     ])

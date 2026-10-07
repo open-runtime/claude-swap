@@ -144,6 +144,28 @@ class TestUiSettings:
         settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "purple"}}))
         assert load_ui_settings(tmp_path).theme == "auto"
 
+
+class TestSpendSettings:
+    def test_missing_file_means_no_budget(self, tmp_path: Path):
+        from claude_swap.settings import SpendSettings, load_spend_settings
+
+        assert load_spend_settings(tmp_path) == SpendSettings(monthly_budget=None)
+
+    def test_set_and_read_monthly_budget(self, tmp_path: Path):
+        from claude_swap.settings import load_spend_settings, set_setting
+
+        assert set_setting(tmp_path, "spend.monthlyBudget", "5000") == 5000.0
+        assert load_spend_settings(tmp_path).monthly_budget == 5000.0
+        rows = {spec.dotted: (value, is_set) for spec, value, is_set in effective_settings(tmp_path)}
+        assert rows["spend.monthlyBudget"] == (5000.0, True)
+
+    def test_garbage_budget_reads_as_none(self, tmp_path: Path):
+        from claude_swap.settings import load_spend_settings
+
+        for bad in ("5000", True, -1, None):
+            settings_path(tmp_path).write_text(json.dumps({"spend": {"monthlyBudget": bad}}))
+            assert load_spend_settings(tmp_path).monthly_budget is None
+
     def test_set_and_unset_ui_theme(self, tmp_path: Path):
         assert set_setting(tmp_path, "ui.theme", "light") == "light"
         raw = json.loads(settings_path(tmp_path).read_text())
@@ -169,7 +191,9 @@ class TestSettingSpecs:
         }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        from claude_swap.settings import SpendSettings
+
+        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings(), "spend": SpendSettings()}
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

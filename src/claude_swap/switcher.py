@@ -129,13 +129,20 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
     spend = usage.get("spend")
     if spend:
         used = spend["used"]
-        limit = spend["limit"]
-        pct = spend["pct"]
+        limit = spend.get("limit")
+        pct = spend.get("pct")
         cell = oauth.fresh_reset_strings(spend)
-        if cell:
-            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
+        if limit is not None and pct is not None:
+            amounts = f"${used:,.2f} / ${limit:,.2f}"
+            lead = f"{pct:>3.0f}%"
         else:
-            rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+            # Uncapped extra usage: no percentage, just what has been billed.
+            amounts = f"${used:,.2f} billed, no cap"
+            lead = "  --"
+        if cell:
+            rows.append(("$$", f"{lead}   resets {cell[1]:<12}  {amounts}"))
+        else:
+            rows.append(("$$", f"{lead}   {amounts}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
