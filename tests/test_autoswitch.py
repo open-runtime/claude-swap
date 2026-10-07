@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -7072,6 +7072,82 @@ def test_forecast_leaves_when_claude_code_reports_a_limit_the_reading_missed(tem
     # A reported hit is a hard limit, so it takes the at-limit escape, not a
     # forecast leave: landing rules for a nearly-full peer are relaxed.
     assert switched.trigger == "at-limit"
+
+
+class TestCredentialBlindness:
+    """Oct 6: the daemon read an empty live credential for 310 ticks while
+    every fresh process read the Keychain item fine; a restart cured it."""
+
+    def _engine(self, temp_home, *, uptime_s: float):
+        import time as _time
+        from claude_swap import autoswitch as module
+
+        harness = EngineHarness(temp_home)
+        harness.seed(1, "a@example.com")
+        harness.make_live("a@example.com", 1)
+        engine = harness.engine
+        engine._started_monotonic = _time.monotonic() - uptime_s
+        engine._reexec = MagicMock(name="reexec")
+        return harness, engine, module
+
+    def test_restarts_after_three_consecutive_empty_reads(self, temp_home):
+        harness, engine, module = self._engine(temp_home, uptime_s=module_floor())
+        with patch.object(harness.switcher, "_read_credentials", return_value=""), \
+             patch.object(engine, "_credential_diagnosis", return_value="probe"):
+            for _ in range(module.CREDENTIAL_BLIND_TICKS - 1):
+                engine._watch_credential_blindness()
+            assert not engine._reexec.called
+            engine._watch_credential_blindness()
+        engine._reexec.assert_called_once()
+        assert any(
+            isinstance(e, ErrorEvent) and "restarting the engine" in e.message
+            for e in harness.events
+        )
+
+    def test_a_good_read_resets_the_count(self, temp_home):
+        harness, engine, module = self._engine(temp_home, uptime_s=module_floor())
+        with patch.object(engine, "_credential_diagnosis", return_value="probe"):
+            with patch.object(harness.switcher, "_read_credentials", return_value=""):
+                engine._watch_credential_blindness()
+                engine._watch_credential_blindness()
+            with patch.object(harness.switcher, "_read_credentials", return_value='{"claudeAiOauth": {}}'):
+                engine._watch_credential_blindness()
+            assert engine._blind_ticks == 0
+            with patch.object(harness.switcher, "_read_credentials", return_value=""):
+                engine._watch_credential_blindness()
+                engine._watch_credential_blindness()
+        assert not engine._reexec.called
+
+    def test_a_young_engine_logs_but_does_not_restart(self, temp_home):
+        harness, engine, module = self._engine(temp_home, uptime_s=5.0)
+        with patch.object(harness.switcher, "_read_credentials", return_value=""), \
+             patch.object(engine, "_credential_diagnosis", return_value="probe"):
+            for _ in range(module.CREDENTIAL_BLIND_TICKS + 2):
+                engine._watch_credential_blindness()
+        assert not engine._reexec.called
+
+    def test_a_raising_read_is_not_counted_as_blind(self, temp_home):
+        harness, engine, module = self._engine(temp_home, uptime_s=module_floor())
+        with patch.object(harness.switcher, "_read_credentials", side_effect=OSError("keychain busy")):
+            for _ in range(module.CREDENTIAL_BLIND_TICKS + 1):
+                engine._watch_credential_blindness()
+        assert engine._blind_ticks == 0
+        assert not engine._reexec.called
+
+    def test_diagnosis_names_store_flags_and_the_security_answer(self, temp_home):
+        harness, engine, module = self._engine(temp_home, uptime_s=module_floor())
+        with patch("claude_swap.macos_keychain.describe_item", return_value="rc=44 not found"), \
+             patch("claude_swap.macos_keychain.keychain_account_name", return_value="me"), \
+             patch("claude_swap.credentials._active_oauth_keychain_services", return_value=["Claude Code-credentials"]):
+            text = engine._credential_diagnosis()
+        assert "security[Claude Code-credentials]: rc=44 not found" in text
+        assert "keychain_usable_cache=" in text
+
+
+def module_floor() -> float:
+    from claude_swap import autoswitch as module
+
+    return module.REEXEC_MIN_UPTIME_S + 1.0
 
 
 def test_forecast_trusts_a_reading_taken_after_the_reported_limit(temp_home, tmp_path):

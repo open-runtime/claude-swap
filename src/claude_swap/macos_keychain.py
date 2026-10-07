@@ -134,6 +134,31 @@ def get_password(service: str, account: str) -> str | None:
     )
 
 
+def describe_item(service: str, account: str) -> str:
+    """One line saying how ``security`` answers an attribute-only lookup.
+
+    For diagnostics when a credential read comes back empty: ``rc=0 found``,
+    ``rc=44 not found``, ``rc=N <stderr>``, ``timed out`` or ``no security
+    binary``. Never decrypts (no ``-w``), so it cannot prompt, and never raises.
+    """
+    try:
+        result = subprocess.run(
+            [_SECURITY, "find-generic-password", "-a", account, "-s", service],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"timed out after {_TIMEOUT}s"
+    except OSError as error:
+        return f"no security binary ({error})"
+    if result.returncode == 0:
+        return "rc=0 found"
+    if result.returncode == _NOT_FOUND_RC:
+        return f"rc={_NOT_FOUND_RC} not found"
+    return f"rc={result.returncode} {result.stderr.strip()[:160]}"
+
+
 def item_exists(service: str, account: str) -> bool:
     """Whether a generic-password item exists, without touching its secret.
 

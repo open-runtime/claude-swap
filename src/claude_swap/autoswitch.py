@@ -33,7 +33,9 @@ import enum
 import json
 import logging
 import math
+import os
 import random
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -59,6 +61,19 @@ STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
 # How long a Fable refusal keeps an organization out of Fable landings.
 FABLE_REFUSAL_HOLD_S = 3600.0
+
+# Consecutive ticks on which the live credential read back empty before the
+# engine restarts itself. On Oct 6 the daemon read "" for five hours (310
+# ticks) while every fresh process read the same Keychain item in 20ms, and
+# a restart cured it both times it happened; whatever the in-process cause,
+# the cure is a fresh process. Three ticks is a few minutes: long enough to
+# ride out a Keychain lock during sleep/wake, short enough that the rotator
+# is not blind through a whole session window.
+CREDENTIAL_BLIND_TICKS = 3
+# Floor between self-restarts, so a cause a restart cannot cure (Keychain
+# genuinely locked, item deleted) produces one restart every ten minutes and
+# a diagnosis line each time, not a tight loop.
+REEXEC_MIN_UPTIME_S = 600.0
 
 # How far back the engine looks for a limit Claude Code reported hitting on
 # an organization. A hit outranks any usage reading taken before it; a
@@ -691,6 +706,10 @@ class AutoSwitchEngine:
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
         self._unhealthy_ticks = 0
+        # Consecutive ticks whose live credential read came back empty; see
+        # _watch_credential_blindness and CREDENTIAL_BLIND_TICKS.
+        self._blind_ticks = 0
+        self._started_monotonic = time.monotonic()
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -2680,6 +2699,84 @@ class AutoSwitchEngine:
         except Exception:
             return delay
 
+    def _watch_credential_blindness(self) -> None:
+        """Restart the engine once the live credential has read empty for
+        ``CREDENTIAL_BLIND_TICKS`` ticks in a row.
+
+        Called only after a tick that erred or found the active account's
+        usage unknown, both of which an unreadable credential produces, so a
+        healthy engine pays nothing. One attribute-only ``security`` probe and
+        the store's routing flags go into the log first, so the next outage
+        is diagnosed from one line instead of reconstructed from the gaps.
+        """
+        try:
+            value = self.switcher._read_credentials()
+        except Exception as error:  # a raising read is a different failure
+            _logger.debug("credential blindness check failed: %s", error)
+            return
+        if value:
+            self._blind_ticks = 0
+            return
+        self._blind_ticks += 1
+        if self._blind_ticks < CREDENTIAL_BLIND_TICKS:
+            return
+        _logger.warning(
+            "Live credential read empty on %d consecutive ticks; %s",
+            self._blind_ticks,
+            self._credential_diagnosis(),
+        )
+        uptime = time.monotonic() - self._started_monotonic
+        if uptime < REEXEC_MIN_UPTIME_S:
+            _logger.warning(
+                "Not restarting: engine is only %.0fs old (floor %.0fs)",
+                uptime,
+                REEXEC_MIN_UPTIME_S,
+            )
+            return
+        self._emit(
+            ErrorEvent(
+                message=(
+                    f"live credential unreadable for {self._blind_ticks} ticks; "
+                    "restarting the engine in place"
+                ),
+                transient=True,
+            )
+        )
+        self._reexec()
+
+    def _credential_diagnosis(self) -> str:
+        """One line of facts about why the live credential reads empty."""
+        from claude_swap import macos_keychain
+        from claude_swap.credentials import _active_oauth_keychain_services
+
+        parts: list[str] = []
+        store = getattr(self.switcher, "_store", None)
+        for flag in (
+            "_keychain_usable_cache",
+            "_keychain_disabled_until",
+            "_file_mode_is_ours",
+            "_keychain_op_failed",
+            "_active_read_failed",
+        ):
+            if store is not None and hasattr(store, flag):
+                parts.append(f"{flag.lstrip('_')}={getattr(store, flag)!r}")
+        try:
+            account = macos_keychain.keychain_account_name()
+            for service in _active_oauth_keychain_services():
+                parts.append(f"security[{service}]: {macos_keychain.describe_item(service, account)}")
+        except Exception as error:
+            parts.append(f"probe failed: {error}")
+        return "; ".join(parts) or "no diagnostics available"
+
+    def _reexec(self) -> None:  # pragma: no cover - replaces the process
+        """Replace this process with a fresh copy of itself, same arguments.
+
+        Open file descriptors survive exec, so the stdout/stderr log the
+        daemon was started with keeps receiving the new process's output.
+        """
+        _logger.warning("Re-executing: %s %s", sys.executable, " ".join(sys.argv))
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
         while True:
@@ -2696,6 +2793,10 @@ class AutoSwitchEngine:
                     ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                 )
                 outcome = TickOutcome.ERROR
+            if outcome is TickOutcome.ERROR or self._unhealthy_ticks > 0:
+                self._watch_credential_blindness()
+            elif self._blind_ticks:
+                self._blind_ticks = 0
             delay = self._next_delay(outcome)
             if delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)

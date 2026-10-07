@@ -77,6 +77,25 @@ def test_item_exists_false_on_rc44_and_errors():
             assert macos_keychain.item_exists("svc", "acct") is False
 
 
+def test_describe_item_reports_each_outcome_without_the_secret():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        assert macos_keychain.describe_item("svc", "acct") == "rc=0 found"
+        assert "-w" not in run.call_args.args[0]
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(44)
+        assert macos_keychain.describe_item("svc", "acct") == "rc=44 not found"
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(36, stderr="User interaction is not allowed.")
+        assert macos_keychain.describe_item("svc", "acct") == "rc=36 User interaction is not allowed."
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.side_effect = subprocess.TimeoutExpired(cmd="security", timeout=5.0)
+        assert macos_keychain.describe_item("svc", "acct").startswith("timed out")
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.side_effect = FileNotFoundError("security")
+        assert macos_keychain.describe_item("svc", "acct").startswith("no security binary")
+
+
 # ---------------------------------------------------------------------------
 # set_password — stdin (security -i) vs argv fallback
 # ---------------------------------------------------------------------------
