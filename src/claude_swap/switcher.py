@@ -201,6 +201,7 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "banned": "account or organization is suspended — held out of rotation",
 }
 
 SENTINEL_NOTES = {
@@ -1832,17 +1833,18 @@ class ClaudeAccountSwitcher:
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
 
-        Excludes slots without usable stored backups and slots the user has
-        disabled (``cswap disable``). Disabled slots stay managed and remain
-        valid explicit ``cswap switch <num|email>`` targets — they are only
-        held out of automatic rotation and the usage-aware strategies.
+        Excludes slots without usable stored backups, slots the user has
+        disabled (``cswap disable``), and slots marked suspended
+        (``banned``). Both holds stay managed and remain valid explicit
+        ``cswap switch <num|email>`` targets — they are only held out of
+        automatic rotation and the usage-aware strategies.
         """
         data = self._get_sequence_data() or {}
         return [
             str(num)
             for num in data.get("sequence", [])
             if self._account_is_switchable(str(num))
-            and not self._disabled_from_data(data, str(num))
+            and self._rotation_hold(data, str(num)) is None
         ]
 
     @staticmethod
@@ -1851,8 +1853,27 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num))
         return bool(record and record.get("disabled"))
 
+    @staticmethod
+    def _banned_from_data(data: dict, account_num: str) -> bool:
+        """Whether a slot is marked suspended in already-loaded data."""
+        record = data.get("accounts", {}).get(str(account_num))
+        return bool(record and record.get("banned"))
+
+    @staticmethod
+    def _rotation_hold(data: dict, account_num: str) -> str | None:
+        """Why automatic rotation skips a slot, or None.
+
+        ``"banned"`` wins when both flags are set: clearing the manual hold
+        would not put a suspended account back into rotation.
+        """
+        if ClaudeAccountSwitcher._banned_from_data(data, account_num):
+            return "banned"
+        if ClaudeAccountSwitcher._disabled_from_data(data, account_num):
+            return "disabled"
+        return None
+
     def is_account_disabled(self, account_num: str) -> bool:
-        """Whether a slot is currently held out of rotation."""
+        """Whether a slot is currently held out of rotation by ``cswap disable``."""
         data = self._get_sequence_data() or {}
         return self._disabled_from_data(data, str(account_num))
 
@@ -1920,6 +1941,90 @@ class ClaudeAccountSwitcher:
                 )
         else:
             print(dimmed("  It is back in the rotation."))
+
+    def clear_account_ban(self, identifier: str) -> None:
+        """Drop a stored suspension mark (``cswap unban``).
+
+        Does not touch the manual ``disabled`` hold. The next usage fetch
+        that still gets a suspension body will mark the slot again.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        account_num, email, _ = self.resolve_account(identifier)
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+
+        if not record.get("banned"):
+            print(dimmed(
+                f"Account-{account_num} ({email}) is not marked banned."
+            ))
+            return
+
+        record.pop("banned", None)
+        record.pop("bannedAt", None)
+        record.pop("bannedReason", None)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Cleared ban on account {account_num}: {email}")
+        print(f"{accent('Cleared')} ban on Account-{account_num} ({email}).")
+        if record.get("disabled"):
+            print(dimmed(
+                "  It is still disabled — it stays out of rotation until "
+                "cswap enable."
+            ))
+        else:
+            print(dimmed("  It is back in the rotation."))
+
+    def _sync_ban_flags(self, records: dict[str, FetchRecord]) -> None:
+        """Persist or clear suspension marks from accepted usage fetches.
+
+        A ``banned`` error sets ``banned``, ``bannedAt``, and ``bannedReason``.
+        ``bannedAt`` stays put while the phrase is unchanged. A later fetch
+        that returned a real usage dict clears the mark. An empty success
+        and every other error leave it alone.
+        """
+        if not records:
+            return
+        data = self._get_sequence_data()
+        if not data:
+            return
+        accounts = data.get("accounts") or {}
+        changed = False
+        for num, record in records.items():
+            acct = accounts.get(str(num))
+            if not isinstance(acct, dict):
+                continue
+            if record.error == "banned":
+                reason = (
+                    record.ban_reason or "account or organization suspended"
+                )[:160]
+                already = bool(acct.get("banned"))
+                prev_reason = acct.get("bannedReason")
+                if already and prev_reason == reason and acct.get("bannedAt"):
+                    continue
+                acct["banned"] = True
+                acct["bannedReason"] = reason
+                if not already or not acct.get("bannedAt") or prev_reason != reason:
+                    acct["bannedAt"] = get_timestamp()
+                changed = True
+                continue
+            if (
+                record.error is None
+                and record.sentinel is None
+                and isinstance(record.usage, dict)
+                and record.usage
+                and acct.get("banned")
+            ):
+                acct.pop("banned", None)
+                acct.pop("bannedAt", None)
+                acct.pop("bannedReason", None)
+                changed = True
+        if changed:
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -4185,6 +4290,7 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    ban_reason=outcome.ban_reason,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -4196,7 +4302,9 @@ class ClaudeAccountSwitcher:
             # an ERROR (backoff, strike accounting), not a "token expired"
             # sentinel mislabeling an unexpired token.
             force_refresh = FetchRecord(
-                error=outcome.error, retry_after_s=outcome.retry_after_s,
+                error=outcome.error,
+                retry_after_s=outcome.retry_after_s,
+                ban_reason=outcome.ban_reason,
             )
 
         # Expired (or server-rejected). Before any recovery that would
@@ -4633,6 +4741,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            ban_reason=outcome.ban_reason,
         )
 
     def _resync_rotated_backup(
@@ -4904,6 +5013,7 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
+            ban_reason=outcome.ban_reason,
         )
 
     def _read_only_fetch(
@@ -4926,6 +5036,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            ban_reason=outcome.ban_reason,
         )
 
     def _run_usage_fetches(
@@ -5071,6 +5182,7 @@ class ClaudeAccountSwitcher:
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
             }
+            self._sync_ban_flags(accepted_records)
             for num, record in accepted_records.items():
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
@@ -5333,7 +5445,7 @@ class ClaudeAccountSwitcher:
             str(n) for n in data.get("sequence", [])
             if str(n) != str(current_num)
             and self._account_is_switchable(str(n))
-            and not self._disabled_from_data(data, str(n))
+            and self._rotation_hold(data, str(n)) is None
         ]
         if not others:
             return None, "none"
@@ -5507,6 +5619,17 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    banned=self._banned_from_data(seq_data, str(num)),
+                    banned_reason=(
+                        (seq_data.get("accounts", {}).get(str(num)) or {}).get(
+                            "bannedReason"
+                        )
+                    ),
+                    banned_at=(
+                        (seq_data.get("accounts", {}).get(str(num)) or {}).get(
+                            "bannedAt"
+                        )
+                    ),
                 )
             )
         payload = {
@@ -5571,6 +5694,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            if self._banned_from_data(seq_data, str(num)):
+                markers += f" {muted('(banned)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
@@ -5884,9 +6009,11 @@ class ClaudeAccountSwitcher:
                 raise ConfigError("No accounts are managed yet")
 
             target = str(preferred)
-            target_disabled = self._disabled_from_data(data, target)
-            if target_disabled or not self._account_is_switchable(target):
-                if target_disabled:
+            target_hold = self._rotation_hold(data, target)
+            if target_hold or not self._account_is_switchable(target):
+                if target_hold == "banned":
+                    reason = console_reason = "(banned)"
+                elif target_hold == "disabled":
                     reason = console_reason = "(disabled)"
                 else:
                     reason = "(no stored credentials/config)"
@@ -5901,7 +6028,7 @@ class ClaudeAccountSwitcher:
                 fallback = next(
                     (str(num) for num in sequence
                      if str(num) != target
-                     and not self._disabled_from_data(data, str(num))
+                     and self._rotation_hold(data, str(num)) is None
                      and self._account_is_switchable(str(num))),
                     None,
                 )
@@ -5909,6 +6036,22 @@ class ClaudeAccountSwitcher:
                     if any(
                         self._account_is_switchable(str(num)) for num in sequence
                     ):
+                        holds = [
+                            self._rotation_hold(data, str(num))
+                            for num in sequence
+                            if self._account_is_switchable(str(num))
+                        ]
+                        if holds and all(hold == "banned" for hold in holds):
+                            raise ConfigError(
+                                "No accounts remain in rotation. Clear a false "
+                                "suspension with: cswap unban <num|email>"
+                            )
+                        if any(hold == "banned" for hold in holds):
+                            raise ConfigError(
+                                "No accounts remain in rotation. Re-enable one "
+                                "with: cswap enable <num|email> — or clear a "
+                                "false suspension with: cswap unban <num|email>"
+                            )
                         raise ConfigError(
                             "No accounts remain in rotation. Re-enable one with: "
                             "cswap enable <num|email>"
@@ -6096,11 +6239,12 @@ class ClaudeAccountSwitcher:
         skipped_exhausted: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
-            if self._disabled_from_data(data, candidate):
+            hold = self._rotation_hold(data, candidate)
+            if hold:
                 if json_output:
-                    warnings.append(f"Skipped Account-{candidate} (disabled)")
+                    warnings.append(f"Skipped Account-{candidate} ({hold})")
                 else:
-                    print(f"{accent('Skipping')} Account-{candidate} (disabled)")
+                    print(f"{accent('Skipping')} Account-{candidate} ({hold})")
                 continue
             if not self._account_is_switchable(candidate):
                 if json_output:

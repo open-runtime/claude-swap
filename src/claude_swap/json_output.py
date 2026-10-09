@@ -335,6 +335,9 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    banned: bool = False,
+    banned_reason: str | None = None,
+    banned_at: str | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -355,6 +358,14 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive, same rule as ``disabled``. A suspension is the server's hold
+    # (``cswap unban`` clears a false mark). Absent on every other row.
+    if banned:
+        row["banned"] = True
+        if banned_reason:
+            row["bannedReason"] = banned_reason
+        if banned_at:
+            row["bannedAt"] = banned_at
     # Additive field: when the stored login records the expiry of its refresh
     # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
     # ``relogin_required`` that follows; absent when the login carries none.

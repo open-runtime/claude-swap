@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -407,14 +408,54 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+# A ban is an account or organization the server has suspended. A bare 403,
+# a disabled feature, or the manual ``cswap disable`` hold must not match.
+_BAN_TEXT = re.compile(
+    r"(account|organization|organisation).{0,48}"
+    r"(suspended|banned|has been disabled)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def ban_reason(text: str) -> str | None:
+    """Return a short suspension phrase from ``text``, or None.
+
+    Matches Anthropic wording such as "Your account has been disabled" and
+    "This organization has been suspended". The phrase is what gets stored
+    on the account; it is not a full response body.
+    """
+    if not text:
+        return None
+    match = _BAN_TEXT.search(text)
+    if not match:
+        return None
+    snippet = " ".join(match.group(0).split())
+    return snippet[:160]
+
+
+def _http_error_text(e: urllib.error.HTTPError) -> str:
+    """Read a usage-error body once. Empty when the server sent none."""
+    try:
+        raw = e.read()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
     (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
-    exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
-    HTTP-date form is rare enough to ignore).
+    exception type name as a fallback). A 401 or 403 whose body says the
+    account or organization is suspended is ``"banned"`` instead of the HTTP
+    code, and the matched phrase is stashed on ``e.claude_swap_ban_reason``.
+    ``retry_after_s`` is the parsed ``Retry-After`` header when the server
+    sent one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
@@ -424,6 +465,11 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
                 retry_after = max(0.0, float(raw.strip()))
             except ValueError:
                 pass
+        if e.code in (401, 403):
+            reason = ban_reason(_http_error_text(e))
+            if reason:
+                e.claude_swap_ban_reason = reason  # type: ignore[attr-defined]
+                return "banned", retry_after
         return f"http-{e.code}", retry_after
     if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
         return "timeout", None
@@ -617,6 +663,8 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
+    # Set when ``error == "banned"``: the suspension phrase from the body.
+    ban_reason: str | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -712,14 +760,20 @@ def try_fetch_usage_for_account(
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
+        ban = getattr(e, "claude_swap_ban_reason", None)
+        # A suspension is not a refreshable 401. Do not spend a refresh token
+        # trying to heal an account the server has already banned.
         if (
-            e.code != 401
+            kind == "banned"
+            or e.code != 401
             or is_active
             or not oauth
             or not oauth.get("refreshToken")
         ):
             _log_usage_failure(context, e, kind, retry_after)
-            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+            return UsageOutcome(
+                None, error=kind, retry_after_s=retry_after, ban_reason=ban,
+            )
 
         # Retry once after refreshing on 401 (inactive accounts only). A
         # server-rejected grant (invalid_grant) means this refresh-token lineage
@@ -761,8 +815,11 @@ def try_fetch_usage_for_account(
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
+            ban = getattr(retry_error, "claude_swap_ban_reason", None)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
-            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+            return UsageOutcome(
+                None, error=kind, retry_after_s=retry_after, ban_reason=ban,
+            )
     except Exception as e:
         kind, retry_after = _classify_usage_error(e)
         _log_usage_failure(context, e, kind, retry_after)

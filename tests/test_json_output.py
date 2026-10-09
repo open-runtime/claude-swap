@@ -754,6 +754,27 @@ class TestAccountRowDisabled:
         assert "disabled" not in row
 
 
+class TestAccountRowBanned:
+    """The additive suspension fields on --list rows."""
+
+    def test_banned_fields_included(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            banned=True,
+            banned_reason="account has been disabled",
+            banned_at="2026-10-09T19:00:00Z",
+        )
+        assert row["banned"] is True
+        assert row["bannedReason"] == "account has been disabled"
+        assert row["bannedAt"] == "2026-10-09T19:00:00Z"
+
+    def test_banned_absent_by_default(self):
+        row = account_row(1, "a@example.com", "", "", False, None)
+        assert "banned" not in row
+        assert "bannedReason" not in row
+        assert "bannedAt" not in row
+
+
 class TestUsageFromJson:
     """``list --json`` usage read back into the internal dict (import-usage)."""
 

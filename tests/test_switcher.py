@@ -8990,6 +8990,213 @@ class TestDisableEnableAccount:
         assert "disabled" not in rows[1]
 
 
+class TestBanFlags:
+    """A usage-API suspension is stored on the slot and held out of rotation.
+
+    Distinct from ``cswap disable``. A later real usage reading clears it.
+    ``cswap unban`` is the false-positive escape hatch.
+    """
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-{num}", "refreshToken": f"rt-{num}"}}),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({"oauthAccount": {
+                "emailAddress": email, "accountUuid": f"uuid-{num}"}}),
+        )
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        data["accounts"][str(num)] = {
+            "email": email, "uuid": f"uuid-{num}",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-live-{num}", "refreshToken": f"rt-live-{num}"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}
+        }))
+
+    def test_sync_sets_and_keeps_banned_at(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        with patch("claude_swap.switcher.get_timestamp", return_value="T1"):
+            s._sync_ban_flags({
+                "1": FetchRecord(
+                    error="banned", ban_reason="account has been disabled",
+                ),
+            })
+        acct = s._get_sequence_data()["accounts"]["1"]
+        assert acct["banned"] is True
+        assert acct["bannedReason"] == "account has been disabled"
+        assert acct["bannedAt"] == "T1"
+        assert s.switchable_account_numbers() == []
+
+        with patch("claude_swap.switcher.get_timestamp", return_value="T2"):
+            s._sync_ban_flags({
+                "1": FetchRecord(
+                    error="banned", ban_reason="account has been disabled",
+                ),
+            })
+        acct = s._get_sequence_data()["accounts"]["1"]
+        assert acct["bannedAt"] == "T1"
+        assert s._get_sequence_data()["lastUpdated"] == "T1"
+
+    def test_reason_change_refreshes_banned_at(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        with patch("claude_swap.switcher.get_timestamp", return_value="T1"):
+            s._sync_ban_flags({
+                "1": FetchRecord(error="banned", ban_reason="account suspended"),
+            })
+        with patch("claude_swap.switcher.get_timestamp", return_value="T2"):
+            s._sync_ban_flags({
+                "1": FetchRecord(
+                    error="banned",
+                    ban_reason="organization has been suspended",
+                ),
+            })
+        acct = s._get_sequence_data()["accounts"]["1"]
+        assert acct["bannedReason"] == "organization has been suspended"
+        assert acct["bannedAt"] == "T2"
+
+    def test_real_usage_clears_ban_empty_success_does_not(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        s._sync_ban_flags({
+            "1": FetchRecord(error="banned", ban_reason="account has been disabled"),
+        })
+        s._sync_ban_flags({"1": FetchRecord(usage=None)})
+        s._sync_ban_flags({"1": FetchRecord(usage={})})
+        s._sync_ban_flags({"1": FetchRecord(error="http-429")})
+        assert s._get_sequence_data()["accounts"]["1"]["banned"] is True
+
+        s._sync_ban_flags({
+            "1": FetchRecord(usage={"five_hour": {"pct": 0}}),
+        })
+        acct = s._get_sequence_data()["accounts"]["1"]
+        assert "banned" not in acct
+        assert "bannedAt" not in acct
+        assert "bannedReason" not in acct
+        assert s.switchable_account_numbers() == ["1"]
+
+    def test_missing_phrase_uses_fallback(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        s._sync_ban_flags({"1": FetchRecord(error="banned")})
+        acct = s._get_sequence_data()["accounts"]["1"]
+        assert acct["bannedReason"] == "account or organization suspended"
+
+    def test_rotation_skips_banned_not_disabled(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["banned"] = True
+        s._write_json(s.sequence_file, data)
+        assert s.switchable_account_numbers() == ["1", "3"]
+        assert s.is_account_disabled("2") is False
+
+        self._make_live(temp_home, "a@example.com", 1)
+        with patch.object(s, "list_accounts"):
+            s.switch()
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (banned)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_best_strategy_ignores_banned_candidate(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["banned"] = True
+        s._write_json(s.sequence_file, data)
+        target, note = s._select_best_switchable("1")
+        assert target is None
+        assert note == "none"
+
+    def test_explicit_switch_to_banned_still_works(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["banned"] = True
+        s._write_json(s.sequence_file, data)
+        self._make_live(temp_home, "a@example.com", 1)
+        with patch.object(s, "list_accounts"):
+            s.switch_to("2")
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        assert s._get_sequence_data()["accounts"]["2"]["banned"] is True
+
+    def test_unban_clears_mark_and_restores_rotation(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s._sync_ban_flags({
+            "2": FetchRecord(error="banned", ban_reason="account has been disabled"),
+        })
+        capsys.readouterr()
+        s.clear_account_ban("2")
+        assert "banned" not in s._get_sequence_data()["accounts"]["2"]
+        assert s.switchable_account_numbers() == ["1", "2"]
+        assert "Cleared ban on Account-2" in capsys.readouterr().out
+
+    def test_unban_when_not_banned_is_noop(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        s.clear_account_ban("1")
+        assert "not marked banned" in capsys.readouterr().out
+
+    def test_list_shows_banned_marker_and_json(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["banned"] = True
+        data["accounts"]["2"]["bannedReason"] = "organization has been suspended"
+        data["accounts"]["2"]["bannedAt"] = "2026-10-09T19:11:00Z"
+        s._write_json(s.sequence_file, data)
+
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            s.list_accounts()
+            payload = s.list_accounts(json_output=True)
+        out = capsys.readouterr().out
+        banned_line = next(ln for ln in out.splitlines() if ln.strip().startswith("2:"))
+        assert "(banned)" in banned_line
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert rows[2]["banned"] is True
+        assert rows[2]["bannedReason"] == "organization has been suspended"
+        assert rows[2]["bannedAt"] == "2026-10-09T19:11:00Z"
+        assert "banned" not in rows[1]
+
+
 class TestDegradedReadProvenance:
     """M1 (stale-credential robustness): a credential read that fell back
     after a Keychain failure carries ``degraded=True`` — the bytes may be a

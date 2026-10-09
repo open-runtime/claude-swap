@@ -268,6 +268,10 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # Phrase from a usage-API body that said this account or its organization
+    # is suspended. Set only when ``error == "banned"``. Not a dead-token
+    # strike: the credential may still be well-formed.
+    ban_reason: str | None = None
 
 
 @dataclass(frozen=True)

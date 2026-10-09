@@ -896,6 +896,42 @@ class TestClassifyUsageError:
         assert oauth._classify_usage_error(self._http_error(500))[0] == "http-500"
         assert oauth._classify_usage_error(self._http_error(401))[0] == "http-401"
 
+    @staticmethod
+    def _http_error_body(code: int, body: str):
+        import email.message
+        import io
+        return urllib.error.HTTPError(
+            url="https://api.anthropic.com/api/oauth/usage",
+            code=code,
+            msg="err",
+            hdrs=email.message.Message(),
+            fp=io.BytesIO(body.encode()),
+        )
+
+    def test_account_disabled_body_is_banned(self):
+        err = self._http_error_body(403, "Your account has been disabled.")
+        kind, _ = oauth._classify_usage_error(err)
+        assert kind == "banned"
+        assert err.claude_swap_ban_reason == "account has been disabled"
+
+    def test_organization_suspended_body_is_banned(self):
+        err = self._http_error_body(
+            401, '{"type":"error","message":"This organization has been suspended"}'
+        )
+        kind, _ = oauth._classify_usage_error(err)
+        assert kind == "banned"
+        assert "organization has been suspended" in err.claude_swap_ban_reason
+
+    def test_bare_403_stays_http(self):
+        kind, _ = oauth._classify_usage_error(self._http_error(403))
+        assert kind == "http-403"
+
+    def test_feature_disabled_is_not_a_ban(self):
+        err = self._http_error_body(403, "This feature has been disabled.")
+        kind, _ = oauth._classify_usage_error(err)
+        assert kind == "http-403"
+        assert oauth.ban_reason("This feature has been disabled.") is None
+
     def test_retry_after_seconds(self):
         kind, retry = oauth._classify_usage_error(
             self._http_error(429, {"Retry-After": "30"})
@@ -958,6 +994,32 @@ class TestTryFetchUsageOutcome:
                 "expiresAt": future_ms,
             }
         })
+
+    def test_banned_401_does_not_refresh(self):
+        """A suspension body must not spend the refresh token."""
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                raise AssertionError("banned 401 must not refresh")
+            raise self._ban_http(req.full_url)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            outcome = oauth.try_fetch_usage_for_account(
+                "7", "development@pieces.app", self._make_credentials(),
+                is_active=False,
+            )
+        assert outcome.error == "banned"
+        assert outcome.usage is None
+        assert outcome.ban_reason == "account has been disabled"
+
+    @staticmethod
+    def _ban_http(url: str):
+        import email.message
+        import io
+        return urllib.error.HTTPError(
+            url, 401, "Unauthorized",
+            hdrs=email.message.Message(),
+            fp=io.BytesIO(b'{"error":{"message":"Your account has been disabled."}}'),
+        )
 
     def test_success_outcome(self):
         resp = MagicMock()

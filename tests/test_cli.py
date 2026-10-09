@@ -1742,6 +1742,14 @@ class TestDisableEnableDispatch:
                 cli.main()
         assert excinfo.value.code == 2
 
+    def test_unban_subcommand_forwards(self):
+        switcher = self._run(["unban", "8"])
+        switcher.clear_account_ban.assert_called_once_with("8")
+
+    def test_legacy_unban_flag_forwards(self):
+        switcher = self._run(["--unban-account", "development@pieces.app"])
+        switcher.clear_account_ban.assert_called_once_with("development@pieces.app")
+
 
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     """Import must allocate nothing; the fixture must allocate inside basetemp.
