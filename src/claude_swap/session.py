@@ -565,6 +565,7 @@ class SessionManager:
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        self.switcher.refuse_source_profile_mutation(account_num)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
@@ -678,6 +679,7 @@ class SessionManager:
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        self.switcher.refuse_source_profile_mutation(account_num)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)

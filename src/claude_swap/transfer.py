@@ -210,6 +210,7 @@ def export_accounts(
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
         record = accounts_map[num]
+        switcher.refuse_source_profile_mutation(num)
         email = record.get("email", "")
         org_uuid = record.get("organizationUuid", "") or ""
 

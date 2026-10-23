@@ -178,6 +178,36 @@ cswap add
 
 This will update the stored credentials without creating a duplicate.
 
+### Use an existing Superset or Claude profile
+
+If another launcher owns a Claude profile, bind that profile instead of copying
+its refresh token into a second store:
+
+```bash
+cswap add --source-profile /absolute/path/to/.claude-account-personal
+cswap add --source-profile default   # ~/.claude.json and the default secure store
+```
+
+Registration checks the signed-in email and organization with Claude's profile
+endpoint. It records the exact source path; it does not copy credentials, change
+the active-account pointer, or interrupt sessions. Existing account aliases and
+disabled flags are preserved. Newly registered accounts start disabled.
+
+Usage reads and token diagnostics then use the source profile's current
+credentials. Claude running in that profile owns token refresh. If the profile
+is unavailable, expired, or signed into a different organization, claude-swap
+reports that state instead of refreshing a saved copy. Reauthenticate through
+the profile's owner (in Superset: Settings → Usage → the matching profile card →
+Switch sign-in…) and register it again when needed. Use an exact absolute path:
+Claude's macOS Keychain naming depends on the literal profile path.
+
+Source-bound accounts are for observation and selection by their existing
+launcher. `cswap run`, switching, credential export, and credential replacement
+are refused for them, including switching away from a bound default profile.
+Launch these accounts through Superset or their original Claude profile. This
+prevents a second independently refreshed copy from invalidating that login.
+Ordinary unbound accounts retain their existing behavior.
+
 ### Other commands
 
 ```bash

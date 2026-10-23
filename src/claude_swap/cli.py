@@ -1166,6 +1166,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Specify slot number when adding account (use with 'add' or 'add-token')",
     )
     parser.add_argument(
+        "--source-profile", metavar="ABSOLUTE_PATH|default",
+        help="With 'add': monitor an external Claude profile read-only; new accounts start disabled",
+    )
+    parser.add_argument(
         "--email",
         metavar="EMAIL",
         help=(
@@ -1384,6 +1388,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
+    if args.source_profile is not None and not args.add_account:
+        parser.error("--source-profile can only be used with 'add'")
+
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
@@ -1441,7 +1448,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot, alias=args.alias)
+            if args.source_profile is not None:
+                switcher.add_account(slot=args.slot, alias=args.alias, source_profile=args.source_profile)
+            else:
+                switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,

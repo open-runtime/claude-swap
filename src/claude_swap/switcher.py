@@ -12,6 +12,7 @@ import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -745,7 +746,20 @@ class ClaudeAccountSwitcher:
         key = (self._read_json(get_global_config_path()) or {}).get("primaryApiKey")
         return key if isinstance(key, str) else ""
 
+    def _refuse_bound_live_store_write(self) -> None:
+        from claude_swap.external_profiles import profile_paths
+        targets = [os.environ.get("CLAUDE_CONFIG_DIR") or str(get_default_claude_config_home())]
+        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+            targets.append(os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"])
+        targets = {Path(target).resolve() for target in targets}
+        for number, record in (self._get_sequence_data() or {}).get("accounts", {}).items():
+            if "sourceProfile" in record:
+                directory, _config, _service = profile_paths(record["sourceProfile"])
+                if Path(directory).resolve() in targets:
+                    self.refuse_source_profile_mutation(number)
+
     def _write_credentials(self, credentials: str) -> None:
+        self._refuse_bound_live_store_write()
         self._store._write_credentials(credentials)
 
     def _prepare_credentials_for_activation(
@@ -815,7 +829,27 @@ class ClaudeAccountSwitcher:
         else:
             self._invalidate_session_credentials(account_num, email)
 
+    def _source_profile_record(self, account_num: str) -> dict | None:
+        record = (self._get_sequence_data() or {}).get("accounts", {}).get(str(account_num))
+        return record if record and "sourceProfile" in record else None
+
+    def _read_source_profile(self, account_num: str):
+        from claude_swap.external_profiles import read_profile
+        record = self._source_profile_record(account_num)
+        return read_profile(record["sourceProfile"], record) if record else None
+
+    def refuse_source_profile_mutation(self, account_num: str) -> None:
+        record = self._source_profile_record(account_num)
+        if record:
+            raise ConfigError(
+                f"Account-{account_num} is bound to source profile {record['sourceProfile']}. "
+                "Launch or sign in through that profile's owner (for example Superset); "
+                "cswap monitors it read-only and cannot copy or refresh its credentials."
+            )
+
     def _read_account_credentials(self, account_num: str, email: str) -> str:
+        # Low-level backup diagnostics remain readable even if the roster is
+        # damaged. Usage/status select source profiles explicitly before this.
         return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
@@ -852,6 +886,7 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
+        self.refuse_source_profile_mutation(account_num)
         self._store._write_account_credentials(account_num, email, credentials)
         try:
             self._post_backup_write(account_num, email)
@@ -932,7 +967,7 @@ class ClaudeAccountSwitcher:
         """
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num))
-        if not record:
+        if not record or "sourceProfile" in record:
             return False
         email = record.get("email", "")
         if not self._read_account_credentials(str(account_num), email):
@@ -1125,6 +1160,8 @@ class ClaudeAccountSwitcher:
         num_b = self._resolve_account_identifier(second)
         if not num_b:
             raise AccountNotFoundError(f"No account found with identifier: {second}")
+        self.refuse_source_profile_mutation(num_a)
+        self.refuse_source_profile_mutation(num_b)
         if num_a == num_b:
             raise ValidationError("Cannot swap an account with itself")
 
@@ -1525,6 +1562,8 @@ class ClaudeAccountSwitcher:
                     f"inflate future account numbers"
                 )
 
+            self.refuse_source_profile_mutation(num_src)
+            self.refuse_source_profile_mutation(target)
             if num_src == target:
                 return num_src, target, False
 
@@ -1697,6 +1736,7 @@ class ClaudeAccountSwitcher:
 
     def read_account_credentials(self, account_num: str, email: str) -> str:
         """Public wrapper for session bootstrap. Empty string when missing."""
+        self.refuse_source_profile_mutation(account_num)
         return self._read_account_credentials(account_num, email)
 
     def write_account_credentials(
@@ -2155,6 +2195,7 @@ class ClaudeAccountSwitcher:
 
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
         """
+        self.refuse_source_profile_mutation(account_num)
         # Store-resolution parity: CC ≥2.1.220 honors
         # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
         # mirrors that resolution on the CAPTURE path (#205 —
@@ -2219,6 +2260,8 @@ class ClaudeAccountSwitcher:
 
         try:
             with FileLock(self.lock_file):
+                if self._source_profile_record(account_num):
+                    return oauth.RefreshOutcome(None, "source-profile")
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2799,6 +2842,12 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
+        source = self._read_source_profile(str(num))
+        if source is not None:
+            if source.state:
+                return [f"source profile: {source.state} (sign in through the profile owner)"]
+            line = _label_token_status("source profile (read-only)", source.credentials)
+            return [line] if line else []
         if looks_like_api_key(creds):
             return []
         if is_active:
@@ -3591,11 +3640,65 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    def bind_source_profile(self, source: str, alias: str | None = None) -> None:
+        from claude_swap.external_profiles import read_profile, verified_profile
+
+        candidate = read_profile(source)
+        if not candidate.identity:
+            raise ConfigError(f"Cannot read source profile identity: {source}")
+        email = candidate.identity["emailAddress"]
+        org = candidate.identity.get("organizationUuid") or ""
+        if alias is not None:
+            try:
+                alias = normalize_alias(alias)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
+        self._setup_directories()
+        self._init_sequence_file()
+        before = self._find_account_slot(self._get_sequence_data(), email, org)
+        # Same order as every refresher: consume -> roster. Registration waits
+        # for an older in-flight refresh, and a waiting refresher rechecks the
+        # binding once it owns these locks. Never publish halfway through a POST.
+        with ExitStack() as locks:
+            if before is not None:
+                locks.enter_context(FileLock(self.credentials_dir / f".consume-{before}.lock"))
+            verified = verified_profile(source)
+            identity = verified.identity
+            if (identity["emailAddress"], identity.get("organizationUuid") or "") != (email, org):
+                raise ConfigError("Source profile identity changed; retry binding.")
+            locks.enter_context(FileLock(self.lock_file))
+            data = self._get_sequence_data()
+            number = self._find_account_slot(data, email, org)
+            if number != before:
+                raise ConfigError("Account slots changed during binding; retry.")
+            if number is None:
+                number = str(max(data.get("sequence", []) or [0]) + 1)
+                data["accounts"][number] = {
+                    "email": email, "organizationUuid": org,
+                    "organizationName": identity.get("organizationName") or "",
+                    "uuid": identity.get("accountUuid") or "",
+                    "added": get_timestamp(), "disabled": True,
+                }
+                data["sequence"].append(int(number))
+            record = data["accounts"][number]
+            if record.get("kind") == "api_key":
+                raise ConfigError("An API-key account cannot be bound to an OAuth source profile.")
+            if alias is not None:
+                if any(n != number and r.get("alias") == alias for n, r in data["accounts"].items()):
+                    raise ValidationError(f"Alias '{alias}' is already in use")
+                record["alias"] = alias
+            record["sourceProfile"] = source
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        self._usage_store.clear_dead_token([number], {number: (email, org)})
+        print(f"Bound Account {number} ({email}) to source profile {source} (read-only).")
+
     def add_account(
         self,
         slot: int | None = None,
         assume_yes: bool = False,
         alias: str | None = None,
+        source_profile: str | None = None,
     ) -> None:
         """Add current account to managed accounts.
 
@@ -3609,6 +3712,11 @@ class ClaudeAccountSwitcher:
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
         """
+        if source_profile is not None:
+            if slot is not None:
+                raise ConfigError("--source-profile matches by identity; --slot is not supported.")
+            self.bind_source_profile(source_profile, alias)
+            return
         self._refuse_session_shell()
         self._setup_directories()
         self._init_sequence_file()
@@ -3624,6 +3732,11 @@ class ClaudeAccountSwitcher:
         if identity is None:
             raise ConfigError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid, current_account_uuid = identity
+        existing = self._find_account_slot(self._get_sequence_data(), current_email, current_org_uuid)
+        if existing is not None:
+            self.refuse_source_profile_mutation(existing)
+        if slot is not None:
+            self.refuse_source_profile_mutation(str(slot))
 
         # When no slot specified and account already exists, refresh credentials in place
         if slot is None and self._account_exists(current_email, current_org_uuid):
@@ -3905,6 +4018,11 @@ class ClaudeAccountSwitcher:
         # identity is matched on (email, org) only, so an api-key and an OAuth
         # account sharing an email would be indistinguishable at switch time.
         self._reject_cross_kind_collision(email, is_api_key)
+        if slot is not None:
+            self.refuse_source_profile_mutation(str(slot))
+        existing = self._find_account_slot(self._get_sequence_data(), email, "")
+        if existing is not None:
+            self.refuse_source_profile_mutation(existing)
 
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
@@ -4171,7 +4289,10 @@ class ClaudeAccountSwitcher:
             alias = account.get("alias", "") or ""
             is_active = str(num) == active_num
 
-            if is_active:
+            source = self._read_source_profile(str(num))
+            if source is not None:
+                creds = source.credentials
+            elif is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
@@ -4221,6 +4342,11 @@ class ClaudeAccountSwitcher:
           the token endpoint rejects its reuse (verified: invalid_grant on
           re-presentation, siblings unaffected).
         """
+        source = self._read_source_profile(account_num)
+        if source is not None:
+            if source.state:
+                return FetchRecord(sentinel=source.state)
+            return self._read_only_fetch(account_num, email, source.credentials, None)
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
@@ -4394,6 +4520,8 @@ class ClaudeAccountSwitcher:
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
+                if self._source_profile_record(account_num):
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 live = self._read_credentials()
                 if live is None:
                     # Read ERROR (locked keychain, unreadable store) — not
@@ -4891,6 +5019,9 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        source = self._read_source_profile(str(num))
+        if source is not None:
+            return source.state
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -4929,6 +5060,11 @@ class ClaudeAccountSwitcher:
         """One network fetch for one account. Never raises. ``rejected_fp``
         is the row's refused-credential stamp, if any."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
+        source = self._read_source_profile(str(num))
+        if source is not None:
+            if source.state:
+                return FetchRecord(sentinel=source.state)
+            return self._read_only_fetch(str(num), email, source.credentials, rejected_fp)
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
@@ -5279,6 +5415,10 @@ class ClaudeAccountSwitcher:
         loop that keeps a dead backup out of quarantine forever. The strike
         holds while ANY stored source still matches the struck generation.
         """
+        if self._source_profile_record(num):
+            # A historical backup strike cannot condemn an externally owned profile.
+            # Its fresh source state/401 controls availability, never backup lineage.
+            return False
         if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
             return True
         if not is_active:
@@ -5762,9 +5902,14 @@ class ClaudeAccountSwitcher:
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
         """
-        active = self._read_active_credentials()
-        creds = active.value or ""
-        self._record_active_verdict(active)
+        source = self._read_source_profile(str(account_num))
+        if source is not None:
+            creds = source.credentials
+            self._record_active_verdict(None)
+        else:
+            active = self._read_active_credentials()
+            creds = active.value or ""
+            self._record_active_verdict(active)
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
@@ -6408,6 +6553,7 @@ class ClaudeAccountSwitcher:
                 f"No account found with identifier: {identifier}"
             )
 
+        self.refuse_source_profile_mutation(target_account)
         data = self._get_sequence_data()
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
@@ -6866,6 +7012,8 @@ class ClaudeAccountSwitcher:
         """
         from claude_swap.session import scan_live_sessions
 
+        self.refuse_source_profile_mutation(target_account)
+        self._refuse_bound_live_store_write()
         self._refuse_session_shell()
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
@@ -6939,6 +7087,8 @@ class ClaudeAccountSwitcher:
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+            self.refuse_source_profile_mutation(target_account)
+            self._refuse_bound_live_store_write()
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
@@ -6950,6 +7100,8 @@ class ClaudeAccountSwitcher:
                 current_account = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+                if current_account:
+                    self.refuse_source_profile_mutation(current_account)
 
             config_path = self._get_claude_config_path()
 
