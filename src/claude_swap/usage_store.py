@@ -503,12 +503,16 @@ def due_candidates(
             and not plan_oversleeps_interval(entry, now)
         ):
             continue
-        if entry.fetched_at is None:
+        touched = max(entry.fetched_at or 0.0, entry.last_attempt_at or 0.0)
+        # A no-measurement attempt must rotate behind older due peers instead
+        # of monopolizing the never-read/reset priority on every tick.
+        attempted_since_read = (entry.last_attempt_at or 0.0) > (entry.fetched_at or 0.0)
+        if entry.fetched_at is None and not attempted_since_read:
             due.append((0, 0.0, num))
-        elif rolled_over:
-            due.append((1, entry.fetched_at, num))
+        elif rolled_over and not attempted_since_read:
+            due.append((1, touched, num))
         else:
-            due.append((2, entry.fetched_at, num))
+            due.append((2, touched, num))
     due.sort()
     return [num for _, _, num in due]
 

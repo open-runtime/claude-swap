@@ -284,3 +284,41 @@ def test_current_source_state_overrides_cached_healthy_usage(temp_home):
         entry = s._collect_usage_entries(info)["1"]
     assert entry.decision_value() == "no credentials"
     fetch.assert_not_called()
+
+
+def test_named_profile_empty_legacy_config_uses_current_identity(temp_home):
+    """Claude ignores a writable empty legacy file when .claude.json exists."""
+    from pathlib import Path
+    from claude_swap.external_profiles import read_profile
+
+    source = profile(temp_home / "named-empty-legacy")
+    (Path(source) / ".config.json").write_text("")
+    result = read_profile(source)
+    assert result.state is None
+    assert result.identity["emailAddress"] == EMAIL
+    assert oauth.extract_access_token(result.credentials) == "access-original"
+
+
+def test_named_profile_nonempty_legacy_config_keeps_precedence(temp_home):
+    from pathlib import Path
+    from claude_swap.external_profiles import read_profile
+
+    source = profile(temp_home / "named-with-legacy")
+    (Path(source) / ".config.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "legacy@example.com", "organizationUuid": ORG,
+        "accountUuid": "user-1"}}))
+    result = read_profile(source)
+    assert result.state is None
+    assert result.identity["emailAddress"] == "legacy@example.com"
+
+
+def test_bound_slot_never_adopts_a_historical_swap_session(temp_home):
+    """A binding may be published after a caller's initial source check."""
+    s, _, _ = switcher(temp_home)
+    with patch("claude_swap.session.profile_is_quiescent", return_value=True), \
+         patch("claude_swap.session.read_session_identity", return_value=(EMAIL, ORG)), \
+         patch.object(s, "_session_profile_ahead", return_value=credential("old-swap-profile")) as ahead, \
+         patch.object(s._store, "_write_account_credentials") as write:
+        assert s._adopt_session_credential("1", EMAIL, ORG) is None
+    ahead.assert_not_called()
+    write.assert_not_called()

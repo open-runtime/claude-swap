@@ -12,6 +12,7 @@ import math
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
+from claude_swap.models import AccountPolicy
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
@@ -334,6 +335,7 @@ def account_row(
     backoff_until: float | None = None,
     alias: str = "",
     disabled: bool = False,
+    policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
     banned: bool = False,
     banned_reason: str | None = None,
@@ -366,6 +368,11 @@ def account_row(
             row["bannedReason"] = banned_reason
         if banned_at:
             row["bannedAt"] = banned_at
+    # Same convention for the per-account policy: a slot on the global default
+    # emits neither key, so a fleet that never sets a policy produces rows
+    # byte-identical to those from before this feature existed.
+    if policy.threshold is not None:
+        row["threshold"] = policy.threshold
     # Additive field: when the stored login records the expiry of its refresh
     # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
     # ``relogin_required`` that follows; absent when the login carries none.

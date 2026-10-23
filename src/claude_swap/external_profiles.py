@@ -18,7 +18,9 @@ from claude_swap.json_output import (
     USAGE_FOREIGN_CREDENTIAL, USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS, USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.paths import get_default_claude_config_home, get_default_global_config_path
+from claude_swap.paths import (
+    _pick_global_config, get_default_claude_config_home, get_default_global_config_path,
+)
 
 
 @dataclass(frozen=True)
@@ -36,7 +38,7 @@ def profile_paths(source: str) -> tuple[str, Path, str | None]:
         raise ConfigError("A source profile must be an exact absolute path or 'default'.")
     directory = Path(source)
     legacy = directory / ".config.json"
-    return source, legacy if legacy.exists() else directory / ".claude.json", None
+    return source, _pick_global_config(legacy, directory / ".claude.json"), None
 
 
 def read_profile(source: str, expected: dict | None = None) -> ProfileRead:
