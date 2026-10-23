@@ -2026,7 +2026,7 @@ class ClaudeAccountSwitcher:
     def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
         """Resolve an identifier and fetch its record, ready for a policy write.
 
-        Called by :meth:`set_account_threshold`. Every
+        Called by :meth:`set_account_threshold` with the roster lock held. Every
         raising path here happens **before** any write, so a rejected call
         leaves ``sequence.json`` byte-identical.
 
@@ -2051,6 +2051,8 @@ class ClaudeAccountSwitcher:
 
     def set_account_threshold(self, identifier: str, threshold: object | None) -> None:
         """Set or clear one account's own switch-away threshold.
+
+        Caller must not hold ``self.lock_file`` (non-reentrant).
 
         The per-account value replaces ``autoswitch.threshold`` for this
         account only, in both directions: the departure gate uses the *active*
@@ -2079,27 +2081,30 @@ class ClaudeAccountSwitcher:
         # order matters only in that both checks precede the single write.
         normalized = None if threshold is None else normalize_account_threshold(threshold)
 
-        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        # Resolve and replace one current roster snapshot under the same lock
+        # as source binding, so this metadata write cannot erase grant ownership.
+        with FileLock(self.lock_file):
+            account_num, email, data, record = self._resolve_for_policy_write(identifier)
 
-        current = record.get("threshold")
-        if normalized is None and "threshold" not in record:
-            print(dimmed(
-                f"Account-{account_num} ({email}) has no threshold override "
-                f"— already using the global default."
-            ))
-            return
-        if normalized is not None and current == normalized:
-            print(dimmed(
-                f"Account-{account_num} ({email}) is already at {normalized:g}%."
-            ))
-            return
+            current = record.get("threshold")
+            if normalized is None and "threshold" not in record:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) has no threshold override "
+                    f"— already using the global default."
+                ))
+                return
+            if normalized is not None and current == normalized:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) is already at {normalized:g}%."
+                ))
+                return
 
-        if normalized is None:
-            record.pop("threshold", None)
-        else:
-            record["threshold"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            if normalized is None:
+                record.pop("threshold", None)
+            else:
+                record["threshold"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
 
         if normalized is None:
             self._logger.info(f"Cleared threshold for account {account_num}: {email}")

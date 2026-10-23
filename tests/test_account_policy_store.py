@@ -468,3 +468,102 @@ class TestTheJsonListPayloadCarriesPolicy(PolicyStoreBase):
         payload = self._payload(self._fleet(temp_home))
         for row in payload["accounts"]:
             assert "threshold" not in row
+
+
+@pytest.mark.parametrize("threshold", [85.0, None], ids=["set", "unset"])
+def test_threshold_serializes_with_binding_and_other_roster_updates(
+    tmp_path: Path, monkeypatch, threshold
+):
+    """A binding publication after the setter's read cannot be overwritten.
+
+    The roster is entirely in memory. Two threads use the real roster lock;
+    events force the binding writer to attempt entry after identifier resolution
+    has returned its snapshot, before the threshold setter can publish it.
+    """
+    from copy import deepcopy
+    from threading import Event, Thread
+    from unittest.mock import Mock
+
+    from claude_swap.locking import FileLock
+
+    s = object.__new__(ClaudeAccountSwitcher)
+    s.sequence_file = tmp_path / "sequence.json"
+    s.sequence_file.touch()  # only the resolver's existence check touches disk
+    s.lock_file = tmp_path / ".lock"
+    s._logger = Mock()
+    roster = {
+        "accounts": {
+            "1": {"email": "first@example.test", "organizationUuid": "", "threshold": 90.0},
+            "2": {"email": "second@example.test", "organizationUuid": "", "disabled": False},
+        },
+        "sequence": [1, 2], "activeAccountNumber": 1,
+    }
+
+    def read():
+        return deepcopy(roster)
+
+    def write(path, data):
+        assert path == s.sequence_file
+        roster.clear()
+        roster.update(deepcopy(data))
+
+    monkeypatch.setattr(s, "_get_sequence_data", read)
+    monkeypatch.setattr(s, "_write_json", write)
+    snapshot_ready, attempted = Event(), Event()
+    blocked, errors = [], []
+
+    def publish_binding():
+        data = read()
+        data["accounts"]["1"]["sourceProfile"] = "default"
+        data["accounts"]["2"].update(disabled=True, banned=True, alias="keep-me")
+        data["activeAccountNumber"] = 2
+        write(s.sequence_file, data)
+
+    def concurrent_writer():
+        try:
+            assert snapshot_ready.wait(2)
+            lock = FileLock(s.lock_file, timeout=0)
+            acquired = lock.acquire()
+            blocked.append(not acquired)
+            if acquired:
+                try:
+                    publish_binding()
+                finally:
+                    lock.release()
+                attempted.set()  # broken setter must see the committed update
+            else:
+                attempted.set()  # locked setter can now finish and release
+                with FileLock(s.lock_file, timeout=2):
+                    publish_binding()
+        except BaseException as exc:
+            errors.append(exc)
+            attempted.set()
+
+    original_resolve = s._resolve_for_policy_write
+
+    def resolve(identifier):
+        snapshot = original_resolve(identifier)
+        snapshot_ready.set()
+        assert attempted.wait(2)
+        return snapshot
+
+    monkeypatch.setattr(s, "_resolve_for_policy_write", resolve)
+    thread = Thread(target=concurrent_writer, daemon=True)
+    thread.start()
+    try:
+        s.set_account_threshold("1", threshold)
+    finally:
+        snapshot_ready.set()
+        thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert not errors
+    assert roster["accounts"]["1"].get("sourceProfile") == "default"
+    assert roster["accounts"]["2"] == {
+        "email": "second@example.test", "organizationUuid": "",
+        "disabled": True, "banned": True, "alias": "keep-me",
+    }
+    assert roster["activeAccountNumber"] == 2
+    assert roster["accounts"]["1"].get("threshold") == threshold
+    if threshold is None:
+        assert "threshold" not in roster["accounts"]["1"]
+    assert blocked == [True]
